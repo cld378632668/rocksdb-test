@@ -8,11 +8,11 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include "util/testharness.h"
-
 #include <string>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include "port/stack_trace.h"
 
 namespace rocksdb {
 namespace test {
@@ -39,18 +39,31 @@ bool RegisterTest(const char* base, const char* name, void (*func)()) {
 }
 
 int RunAllTests() {
-  const char* matcher = getenv("ROCKSDB_TESTS");
+  port::InstallStackTraceHandler();
+
+  const char* one_matcher = getenv("ROCKSDB_TESTS");
+  const char* from_matcher = getenv("ROCKSDB_TESTS_FROM");
 
   int num = 0;
+  bool tests_on = (one_matcher == nullptr && from_matcher == nullptr);
   if (tests != nullptr) {
     for (unsigned int i = 0; i < tests->size(); i++) {
       const Test& t = (*tests)[i];
-      if (matcher != nullptr) {
-        std::string name = t.base;
-        name.push_back('.');
-        name.append(t.name);
-        if (strstr(name.c_str(), matcher) == nullptr) {
-          continue;
+      if (tests_on == false) {
+        if (one_matcher != nullptr || from_matcher != nullptr) {
+          std::string name = t.base;
+          name.push_back('.');
+          name.append(t.name);
+          if (from_matcher != nullptr &&
+              strstr(name.c_str(), from_matcher) != nullptr) {
+            tests_on = true;
+          }
+          if (!tests_on) {
+            if (one_matcher == nullptr ||
+                strstr(name.c_str(), one_matcher) == nullptr) {
+              continue;
+            }
+          }
         }
       }
       fprintf(stderr, "==== Test %s.%s\n", t.base, t.name);
@@ -62,9 +75,9 @@ int RunAllTests() {
   return 0;
 }
 
-std::string TmpDir() {
+std::string TmpDir(Env* env) {
   std::string dir;
-  Status s = Env::Default()->GetTestDirectory(&dir);
+  Status s = env->GetTestDirectory(&dir);
   ASSERT_TRUE(s.ok()) << s.ToString();
   return dir;
 }

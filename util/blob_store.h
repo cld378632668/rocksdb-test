@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#ifndef ROCKSDB_LITE
 #pragma once
 #include "rocksdb/env.h"
 #include "rocksdb/status.h"
@@ -24,8 +25,8 @@ struct BlobChunk {
   uint32_t offset; // in blocks
   uint32_t size; // in blocks
   BlobChunk() {}
-  BlobChunk(uint32_t bucket_id, uint32_t offset, uint32_t size) :
-    bucket_id(bucket_id), offset(offset), size(size) {}
+  BlobChunk(uint32_t _bucket_id, uint32_t _offset, uint32_t _size)
+      : bucket_id(_bucket_id), offset(_offset), size(_size) {}
 
   // returns true if it's immediately before chunk
   bool ImmediatelyBefore(const BlobChunk& chunk) const;
@@ -159,3 +160,4 @@ class BlobStore {
 };
 
 } // namespace rocksdb
+#endif  // ROCKSDB_LITE

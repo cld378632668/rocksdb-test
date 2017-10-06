@@ -11,25 +11,36 @@
 
 #include "db/version_set.h"
 #include "util/coding.h"
+#include "rocksdb/slice.h"
 
 namespace rocksdb {
 
 // Tag numbers for serialized VersionEdit.  These numbers are written to
 // disk and should not be changed.
 enum Tag {
-  kComparator           = 1,
-  kLogNumber            = 2,
-  kNextFileNumber       = 3,
-  kLastSequence         = 4,
-  kCompactPointer       = 5,
-  kDeletedFile          = 6,
-  kNewFile              = 7,
+  kComparator = 1,
+  kLogNumber = 2,
+  kNextFileNumber = 3,
+  kLastSequence = 4,
+  kCompactPointer = 5,
+  kDeletedFile = 6,
+  kNewFile = 7,
   // 8 was used for large value refs
-  kPrevLogNumber        = 9,
+  kPrevLogNumber = 9,
 
   // these are new formats divergent from open source leveldb
-  kNewFile2             = 100  // store smallest & largest seqno
+  kNewFile2 = 100,
+  kNewFile3 = 102,
+  kColumnFamily = 200,  // specify column family for version edit
+  kColumnFamilyAdd = 201,
+  kColumnFamilyDrop = 202,
+  kMaxColumnFamily = 203,
 };
+
+uint64_t PackFileNumberAndPathId(uint64_t number, uint64_t path_id) {
+  assert(number <= kFileNumberMask);
+  return number | (path_id * (kFileNumberMask + 1));
+}
 
 void VersionEdit::Clear() {
   comparator_.clear();
@@ -38,16 +49,22 @@ void VersionEdit::Clear() {
   prev_log_number_ = 0;
   last_sequence_ = 0;
   next_file_number_ = 0;
+  max_column_family_ = 0;
   has_comparator_ = false;
   has_log_number_ = false;
   has_prev_log_number_ = false;
   has_next_file_number_ = false;
   has_last_sequence_ = false;
+  has_max_column_family_ = false;
   deleted_files_.clear();
   new_files_.clear();
+  column_family_ = 0;
+  is_column_family_add_ = 0;
+  is_column_family_drop_ = 0;
+  column_family_name_.clear();
 }
 
-void VersionEdit::EncodeTo(std::string* dst) const {
+bool VersionEdit::EncodeTo(std::string* dst) const {
   if (has_comparator_) {
     PutVarint32(dst, kComparator);
     PutLengthPrefixedSlice(dst, comparator_);
@@ -68,33 +85,63 @@ void VersionEdit::EncodeTo(std::string* dst) const {
     PutVarint32(dst, kLastSequence);
     PutVarint64(dst, last_sequence_);
   }
+  if (has_max_column_family_) {
+    PutVarint32(dst, kMaxColumnFamily);
+    PutVarint32(dst, max_column_family_);
+  }
 
-  for (DeletedFileSet::const_iterator iter = deleted_files_.begin();
-       iter != deleted_files_.end();
-       ++iter) {
+  for (const auto& deleted : deleted_files_) {
     PutVarint32(dst, kDeletedFile);
-    PutVarint32(dst, iter->first);   // level
-    PutVarint64(dst, iter->second);  // file number
+    PutVarint32(dst, deleted.first /* level */);
+    PutVarint64(dst, deleted.second /* file number */);
   }
 
   for (size_t i = 0; i < new_files_.size(); i++) {
     const FileMetaData& f = new_files_[i].second;
-    PutVarint32(dst, kNewFile2);
+    if (!f.smallest.Valid() || !f.largest.Valid()) {
+      return false;
+    }
+    if (f.fd.GetPathId() == 0) {
+      // Use older format to make sure user can roll back the build if they
+      // don't config multiple DB paths.
+      PutVarint32(dst, kNewFile2);
+    } else {
+      PutVarint32(dst, kNewFile3);
+    }
     PutVarint32(dst, new_files_[i].first);  // level
-    PutVarint64(dst, f.number);
-    PutVarint64(dst, f.file_size);
+    PutVarint64(dst, f.fd.GetNumber());
+    if (f.fd.GetPathId() != 0) {
+      PutVarint32(dst, f.fd.GetPathId());
+    }
+    PutVarint64(dst, f.fd.GetFileSize());
     PutLengthPrefixedSlice(dst, f.smallest.Encode());
     PutLengthPrefixedSlice(dst, f.largest.Encode());
     PutVarint64(dst, f.smallest_seqno);
     PutVarint64(dst, f.largest_seqno);
   }
+
+  // 0 is default and does not need to be explicitly written
+  if (column_family_ != 0) {
+    PutVarint32(dst, kColumnFamily);
+    PutVarint32(dst, column_family_);
+  }
+
+  if (is_column_family_add_) {
+    PutVarint32(dst, kColumnFamilyAdd);
+    PutLengthPrefixedSlice(dst, Slice(column_family_name_));
+  }
+
+  if (is_column_family_drop_) {
+    PutVarint32(dst, kColumnFamilyDrop);
+  }
+  return true;
 }
 
 static bool GetInternalKey(Slice* input, InternalKey* dst) {
   Slice str;
   if (GetLengthPrefixedSlice(input, &str)) {
     dst->DecodeFrom(str);
-    return true;
+    return dst->Valid();
   } else {
     return false;
   }
@@ -121,7 +168,6 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
 
   // Temporary storage for parsing
   int level;
-  uint64_t number;
   FileMetaData f;
   Slice str;
   InternalKey key;
@@ -169,6 +215,14 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
         }
         break;
 
+      case kMaxColumnFamily:
+        if (GetVarint32(&input, &max_column_family_)) {
+          has_max_column_family_ = true;
+        } else {
+          msg = "max column family";
+        }
+        break;
+
       case kCompactPointer:
         if (GetLevel(&input, &level, &msg) &&
             GetInternalKey(&input, &key)) {
@@ -182,9 +236,9 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
         }
         break;
 
-      case kDeletedFile:
-        if (GetLevel(&input, &level, &msg) &&
-            GetVarint64(&input, &number)) {
+      case kDeletedFile: {
+        uint64_t number;
+        if (GetLevel(&input, &level, &msg) && GetVarint64(&input, &number)) {
           deleted_files_.insert(std::make_pair(level, number));
         } else {
           if (!msg) {
@@ -192,13 +246,16 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
           }
         }
         break;
+      }
 
-      case kNewFile:
-        if (GetLevel(&input, &level, &msg) &&
-            GetVarint64(&input, &f.number) &&
-            GetVarint64(&input, &f.file_size) &&
+      case kNewFile: {
+        uint64_t number;
+        uint64_t file_size;
+        if (GetLevel(&input, &level, &msg) && GetVarint64(&input, &number) &&
+            GetVarint64(&input, &file_size) &&
             GetInternalKey(&input, &f.smallest) &&
             GetInternalKey(&input, &f.largest)) {
+          f.fd = FileDescriptor(number, 0, file_size);
           new_files_.push_back(std::make_pair(level, f));
         } else {
           if (!msg) {
@@ -206,21 +263,67 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
           }
         }
         break;
-
-      case kNewFile2:
-        if (GetLevel(&input, &level, &msg) &&
-            GetVarint64(&input, &f.number) &&
-            GetVarint64(&input, &f.file_size) &&
+      }
+      case kNewFile2: {
+        uint64_t number;
+        uint64_t file_size;
+        if (GetLevel(&input, &level, &msg) && GetVarint64(&input, &number) &&
+            GetVarint64(&input, &file_size) &&
             GetInternalKey(&input, &f.smallest) &&
             GetInternalKey(&input, &f.largest) &&
             GetVarint64(&input, &f.smallest_seqno) &&
-            GetVarint64(&input, &f.largest_seqno) ) {
+            GetVarint64(&input, &f.largest_seqno)) {
+          f.fd = FileDescriptor(number, 0, file_size);
           new_files_.push_back(std::make_pair(level, f));
         } else {
           if (!msg) {
             msg = "new-file2 entry";
           }
         }
+        break;
+      }
+
+      case kNewFile3: {
+        uint64_t number;
+        uint32_t path_id;
+        uint64_t file_size;
+        if (GetLevel(&input, &level, &msg) && GetVarint64(&input, &number) &&
+            GetVarint32(&input, &path_id) && GetVarint64(&input, &file_size) &&
+            GetInternalKey(&input, &f.smallest) &&
+            GetInternalKey(&input, &f.largest) &&
+            GetVarint64(&input, &f.smallest_seqno) &&
+            GetVarint64(&input, &f.largest_seqno)) {
+          f.fd = FileDescriptor(number, path_id, file_size);
+          new_files_.push_back(std::make_pair(level, f));
+        } else {
+          if (!msg) {
+            msg = "new-file3 entry";
+          }
+        }
+        break;
+      }
+
+      case kColumnFamily:
+        if (!GetVarint32(&input, &column_family_)) {
+          if (!msg) {
+            msg = "set column family id";
+          }
+        }
+        break;
+
+      case kColumnFamilyAdd:
+        if (GetLengthPrefixedSlice(&input, &str)) {
+          is_column_family_add_ = true;
+          column_family_name_ = str.ToString();
+        } else {
+          if (!msg) {
+            msg = "column family add";
+          }
+        }
+        break;
+
+      case kColumnFamilyDrop:
+        is_column_family_drop_ = true;
         break;
 
       default:
@@ -276,13 +379,26 @@ std::string VersionEdit::DebugString(bool hex_key) const {
     r.append("\n  AddFile: ");
     AppendNumberTo(&r, new_files_[i].first);
     r.append(" ");
-    AppendNumberTo(&r, f.number);
+    AppendNumberTo(&r, f.fd.GetNumber());
     r.append(" ");
-    AppendNumberTo(&r, f.file_size);
+    AppendNumberTo(&r, f.fd.GetFileSize());
     r.append(" ");
     r.append(f.smallest.DebugString(hex_key));
     r.append(" .. ");
     r.append(f.largest.DebugString(hex_key));
+  }
+  r.append("\n  ColumnFamily: ");
+  AppendNumberTo(&r, column_family_);
+  if (is_column_family_add_) {
+    r.append("\n  ColumnFamilyAdd: ");
+    r.append(column_family_name_);
+  }
+  if (is_column_family_drop_) {
+    r.append("\n  ColumnFamilyDrop");
+  }
+  if (has_max_column_family_) {
+    r.append("\n  MaxColumnFamily: ");
+    AppendNumberTo(&r, max_column_family_);
   }
   r.append("\n}\n");
   return r;

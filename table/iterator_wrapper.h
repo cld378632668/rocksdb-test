@@ -8,6 +8,9 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #pragma once
+
+#include "rocksdb/iterator.h"
+
 namespace rocksdb {
 
 // A internal wrapper class with an interface similar to Iterator that
@@ -17,17 +20,15 @@ namespace rocksdb {
 class IteratorWrapper {
  public:
   IteratorWrapper(): iter_(nullptr), valid_(false) { }
-  explicit IteratorWrapper(Iterator* iter): iter_(nullptr) {
-    Set(iter);
-  }
-  ~IteratorWrapper() { delete iter_; }
+  explicit IteratorWrapper(Iterator* _iter) : iter_(nullptr) { Set(_iter); }
+  ~IteratorWrapper() {}
   Iterator* iter() const { return iter_; }
 
   // Takes ownership of "iter" and will delete it when destroyed, or
   // when Set() is invoked again.
-  void Set(Iterator* iter) {
+  void Set(Iterator* _iter) {
     delete iter_;
-    iter_ = iter;
+    iter_ = _iter;
     if (iter_ == nullptr) {
       valid_ = false;
     } else {
@@ -35,6 +36,13 @@ class IteratorWrapper {
     }
   }
 
+  void DeleteIter(bool is_arena_mode) {
+    if (!is_arena_mode) {
+      delete iter_;
+    } else {
+      iter_->~Iterator();
+    }
+  }
 
   // Iterator interface methods
   bool Valid() const        { return valid_; }
@@ -60,5 +68,12 @@ class IteratorWrapper {
   bool valid_;
   Slice key_;
 };
+
+class Arena;
+// Return an empty iterator (yields nothing) allocated from arena.
+extern Iterator* NewEmptyIterator(Arena* arena);
+
+// Return an empty iterator with the specified status, allocated arena.
+extern Iterator* NewErrorIterator(const Status& status, Arena* arena);
 
 }  // namespace rocksdb

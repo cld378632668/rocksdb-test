@@ -5,13 +5,18 @@
 #  of patent rights can be found in the PATENTS file in the same directory.
 
 set -e
+if [ -z "$GIT" ]
+then
+  GIT="git"
+fi
+
 # Print out the colored progress info so that it can be brainlessly 
 # distinguished by users.
 function title() {
   echo -e "\033[1;32m$*\033[0m"
 }
 
-usage="Create new rocksdb version and prepare it for the release process\n"
+usage="Create new RocksDB version and prepare it for the release process\n"
 usage+="USAGE: ./make_new_version.sh <version>"
 
 # -- Pre-check
@@ -23,18 +28,19 @@ fi
 ROCKSDB_VERSION=$1
 
 GIT_BRANCH=`git rev-parse --abbrev-ref HEAD`
+echo $GIT_BRANCH
+
 if [ $GIT_BRANCH != "master" ]; then
   echo "Error: Current branch is '$GIT_BRANCH', Please switch to master branch."
+  exit 1
 fi
 
 title "Adding new tag for this release ..."
-git tag -a "$ROCKSDB_VERSION.fb" -m "Rocksdb $ROCKSDB_VERSION"
+BRANCH="$ROCKSDB_VERSION.fb"
+$GIT co -b $BRANCH
 
 # Setting up the proxy for remote repo access
-export http_proxy=http://172.31.255.99:8080
-export https_proxy="$http_proxy";
+title "Pushing new branch to remote repo ..."
+git push origin --set-upstream $BRANCH
 
-title "Pushing new tag to remote repo ..."
-proxycmd.sh git push origin --tags
-
-title "Done!"
+title "Branch $BRANCH is pushed to github;"

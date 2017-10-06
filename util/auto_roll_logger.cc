@@ -18,8 +18,7 @@ Status AutoRollLogger::ResetLogger() {
     return status_;
   }
 
-  if (logger_->GetLogFileSize() ==
-      (size_t)Logger::DO_NOT_SUPPORT_GET_LOG_FILE_SIZE) {
+  if (logger_->GetLogFileSize() == Logger::kDoNotSupportGetLogFileSize) {
     status_ = Status::NotSupported(
         "The underlying logger doesn't support GetLogFileSize()");
   }
@@ -47,7 +46,11 @@ void AutoRollLogger::Logv(const char* format, va_list ap) {
     if ((kLogFileTimeToRoll > 0 && LogExpired()) ||
         (kMaxLogFileSize > 0 && logger_->GetLogFileSize() >= kMaxLogFileSize)) {
       RollLogFile();
-      ResetLogger();
+      Status s = ResetLogger();
+      if (!s.ok()) {
+        // can't really log the error if creating a new LOG file failed
+        return;
+      }
     }
 
     // pin down the current logger_ instance before releasing the mutex.
@@ -77,18 +80,19 @@ Status CreateLoggerFromOptions(
     const std::string& dbname,
     const std::string& db_log_dir,
     Env* env,
-    const Options& options,
+    const DBOptions& options,
     std::shared_ptr<Logger>* logger) {
   std::string db_absolute_path;
   env->GetAbsolutePath(dbname, &db_absolute_path);
   std::string fname = InfoLogFileName(dbname, db_absolute_path, db_log_dir);
 
+  env->CreateDirIfMissing(dbname);  // In case it does not exist
   // Currently we only support roll by time-to-roll and log size
   if (options.log_file_time_to_roll > 0 || options.max_log_file_size > 0) {
     AutoRollLogger* result = new AutoRollLogger(
         env, dbname, db_log_dir,
         options.max_log_file_size,
-        options.log_file_time_to_roll);
+        options.log_file_time_to_roll, options.info_log_level);
     Status s = result->GetStatus();
     if (!s.ok()) {
       delete result;
@@ -98,10 +102,13 @@ Status CreateLoggerFromOptions(
     return s;
   } else {
     // Open a log file in the same directory as the db
-    env->CreateDir(dbname);  // In case it does not exist
     env->RenameFile(fname, OldInfoLogFileName(dbname, env->NowMicros(),
                                               db_absolute_path, db_log_dir));
-    return env->NewLogger(fname, logger);
+    auto s = env->NewLogger(fname, logger);
+    if (logger->get() != nullptr) {
+      (*logger)->SetInfoLogLevel(options.info_log_level);
+    }
+    return s;
   }
 }
 

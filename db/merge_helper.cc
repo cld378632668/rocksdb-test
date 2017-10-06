@@ -21,13 +21,15 @@ namespace rocksdb {
 //       operands_ stores the list of merge operands encountered while merging.
 //       keys_[i] corresponds to operands_[i] for each i.
 void MergeHelper::MergeUntil(Iterator* iter, SequenceNumber stop_before,
-                             bool at_bottom, Statistics* stats) {
+                             bool at_bottom, Statistics* stats, int* steps) {
   // Get a copy of the internal key, before it's invalidated by iter->Next()
   // Also maintain the list of merge operands seen.
+  assert(HasOperator());
   keys_.clear();
   operands_.clear();
   keys_.push_front(iter->key().ToString());
   operands_.push_front(iter->value().ToString());
+  assert(user_merge_operator_);
 
   success_ = false;   // Will become true if we hit Put/Delete or bottom
 
@@ -40,9 +42,12 @@ void MergeHelper::MergeUntil(Iterator* iter, SequenceNumber stop_before,
   ParseInternalKey(keys_.back(), &orig_ikey);
 
   bool hit_the_next_user_key = false;
-  ParsedInternalKey ikey;
   std::string merge_result;  // Temporary value for merge results
+  if (steps) {
+    ++(*steps);
+  }
   for (iter->Next(); iter->Valid(); iter->Next()) {
+    ParsedInternalKey ikey;
     assert(operands_.size() >= 1);        // Should be invariants!
     assert(keys_.size() == operands_.size());
 
@@ -80,9 +85,10 @@ void MergeHelper::MergeUntil(Iterator* iter, SequenceNumber stop_before,
       // We store the result in keys_.back() and operands_.back()
       // if nothing went wrong (i.e.: no operand corruption on disk)
       if (success_) {
-        std::string& key = keys_.back();  // The original key encountered
+        std::string& original_key =
+            keys_.back();  // The original key encountered
         orig_ikey.type = kTypeValue;
-        UpdateInternalKey(&key[0], key.size(),
+        UpdateInternalKey(&original_key[0], original_key.size(),
                           orig_ikey.sequence, orig_ikey.type);
         swap(operands_.back(), merge_result);
       } else {
@@ -91,6 +97,9 @@ void MergeHelper::MergeUntil(Iterator* iter, SequenceNumber stop_before,
 
       // move iter to the next entry (before doing anything else)
       iter->Next();
+      if (steps) {
+        ++(*steps);
+      }
       return;
     }
 
@@ -100,17 +109,17 @@ void MergeHelper::MergeUntil(Iterator* iter, SequenceNumber stop_before,
       //   => store result in operands_.back() (and update keys_.back())
       //   => change the entry type to kTypeValue for keys_.back()
       // We are done! Success!
-      const Slice value = iter->value();
-      success_ = user_merge_operator_->FullMerge(ikey.user_key, &value,
-                                                 operands_, &merge_result,
-                                                 logger_);
+      const Slice val = iter->value();
+      success_ = user_merge_operator_->FullMerge(ikey.user_key, &val, operands_,
+                                                 &merge_result, logger_);
 
       // We store the result in keys_.back() and operands_.back()
       // if nothing went wrong (i.e.: no operand corruption on disk)
       if (success_) {
-        std::string& key = keys_.back();  // The original key encountered
+        std::string& original_key =
+            keys_.back();  // The original key encountered
         orig_ikey.type = kTypeValue;
-        UpdateInternalKey(&key[0], key.size(),
+        UpdateInternalKey(&original_key[0], original_key.size(),
                           orig_ikey.sequence, orig_ikey.type);
         swap(operands_.back(), merge_result);
       } else {
@@ -119,6 +128,9 @@ void MergeHelper::MergeUntil(Iterator* iter, SequenceNumber stop_before,
 
       // move iter to the next entry
       iter->Next();
+      if (steps) {
+        ++(*steps);
+      }
       return;
     }
 
@@ -129,28 +141,13 @@ void MergeHelper::MergeUntil(Iterator* iter, SequenceNumber stop_before,
       //   => then continue because we haven't yet seen a Put/Delete.
       assert(!operands_.empty()); // Should have at least one element in it
 
+      // keep queuing keys and operands until we either meet a put / delete
+      // request or later did a partial merge.
       keys_.push_front(iter->key().ToString());
       operands_.push_front(iter->value().ToString());
-      while (operands_.size() >= 2) {
-        // Returns false when the merge_operator can no longer process it
-        if (user_merge_operator_->PartialMerge(ikey.user_key,
-                                               Slice(operands_[0]),
-                                               Slice(operands_[1]),
-                                               &merge_result,
-                                               logger_)) {
-          // Merging of operands (associative merge) was successful.
-          // Replace these frontmost two operands with the merge result
-          keys_.pop_front();
-          operands_.pop_front();
-          swap(operands_.front(), merge_result);
-        } else {
-          // Merging of operands (associative merge) returned false.
-          // The user merge_operator does not know how to merge these operands.
-          // So we just stack them up until we find a Put/Delete or end of key.
-          break;
-        }
+      if (steps) {
+        ++(*steps);
       }
-      continue;
     }
   }
 
@@ -181,9 +178,9 @@ void MergeHelper::MergeUntil(Iterator* iter, SequenceNumber stop_before,
                                                logger_);
 
     if (success_) {
-      std::string& key = keys_.back();  // The original key encountered
+      std::string& original_key = keys_.back();  // The original key encountered
       orig_ikey.type = kTypeValue;
-      UpdateInternalKey(&key[0], key.size(),
+      UpdateInternalKey(&original_key[0], original_key.size(),
                         orig_ikey.sequence, orig_ikey.type);
 
       // The final value() is always stored in operands_.back()
@@ -191,6 +188,23 @@ void MergeHelper::MergeUntil(Iterator* iter, SequenceNumber stop_before,
     } else {
       RecordTick(stats, NUMBER_MERGE_FAILURES);
       // Do nothing if not success_. Leave keys() and operands() as they are.
+    }
+  } else {
+    // We haven't seen the beginning of the key nor a Put/Delete.
+    // Attempt to use the user's associative merge function to
+    // merge the stacked merge operands into a single operand.
+
+    if (operands_.size() >= 2 &&
+        operands_.size() >= min_partial_merge_operands_ &&
+        user_merge_operator_->PartialMergeMulti(
+            orig_ikey.user_key,
+            std::deque<Slice>(operands_.begin(), operands_.end()),
+            &merge_result, logger_)) {
+      // Merging of operands (associative merge) was successful.
+      // Replace operands with the merge result
+      operands_.clear();
+      operands_.push_front(std::move(merge_result));
+      keys_.erase(keys_.begin(), keys_.end() - 1);
     }
   }
 }

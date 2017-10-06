@@ -39,6 +39,10 @@ class Comparator {
   //
   // Names starting with "rocksdb." are reserved and should not be used
   // by any clients of this package.
+  /*比较器的名称。 
+  用于检查比较器不匹配的情况（即，使用不同的比较器访问由一个比较器创建的DB。
+  只要比较器实现的改变将导致任何两个键的相对顺序改变，该包的用户就应该切换到一个新的名称。
+  以“leveldb”开头的名字是保留的，不应该被这个包的任何用户使用。*/
   virtual const char* Name() const = 0;
 
   // Advanced functions: these are used to reduce the space requirements
@@ -61,6 +65,10 @@ class Comparator {
 // ordering.  The result remains the property of this module and
 // must not be deleted.
 extern const Comparator* BytewiseComparator();
+
+// Return a builtin comparator that uses reverse lexicographic byte-wise
+// ordering.
+extern const Comparator* ReverseBytewiseComparator();
 
 }  // namespace rocksdb
 

@@ -9,16 +9,16 @@
 
 #include "db/builder.h"
 
-#include "db/filename.h"
 #include "db/dbformat.h"
+#include "db/filename.h"
 #include "db/merge_helper.h"
 #include "db/table_cache.h"
 #include "db/version_edit.h"
 #include "rocksdb/db.h"
-#include "rocksdb/table.h"
 #include "rocksdb/env.h"
 #include "rocksdb/iterator.h"
 #include "rocksdb/options.h"
+#include "rocksdb/table.h"
 #include "table/block_based_table_builder.h"
 #include "util/stop_watch.h"
 
@@ -26,55 +26,63 @@ namespace rocksdb {
 
 class TableFactory;
 
-TableBuilder* GetTableBuilder(const Options& options, WritableFile* file,
-                              CompressionType compression_type) {
-  return options.table_factory->GetTableBuilder(options, file,
-                                                compression_type);
+TableBuilder* NewTableBuilder(const ImmutableCFOptions& ioptions,
+                              const InternalKeyComparator& internal_comparator,
+                              WritableFile* file,
+                              const CompressionType compression_type,
+                              const CompressionOptions& compression_opts) {
+  return ioptions.table_factory->NewTableBuilder(
+      ioptions, internal_comparator, file, compression_type, compression_opts);
 }
 
-Status BuildTable(const std::string& dbname,
-                  Env* env,
-                  const Options& options,
-                  const EnvOptions& soptions,
-                  TableCache* table_cache,
-                  Iterator* iter,
-                  FileMetaData* meta,
-                  const Comparator* user_comparator,
+Status BuildTable(const std::string& dbname, Env* env,
+                  const ImmutableCFOptions& ioptions,
+                  const EnvOptions& env_options, TableCache* table_cache,
+                  Iterator* iter, FileMetaData* meta,
+                  const InternalKeyComparator& internal_comparator,
                   const SequenceNumber newest_snapshot,
                   const SequenceNumber earliest_seqno_in_memtable,
-                  const CompressionType compression) {
+                  const CompressionType compression,
+                  const CompressionOptions& compression_opts,
+                  const Env::IOPriority io_priority) {
   Status s;
-  meta->file_size = 0;
+  meta->fd.file_size = 0;
   meta->smallest_seqno = meta->largest_seqno = 0;
   iter->SeekToFirst();
 
   // If the sequence number of the smallest entry in the memtable is
   // smaller than the most recent snapshot, then we do not trigger
   // removal of duplicate/deleted keys as part of this builder.
-  bool purge = options.purge_redundant_kvs_while_flush;
+  bool purge = ioptions.purge_redundant_kvs_while_flush;
   if (earliest_seqno_in_memtable <= newest_snapshot) {
     purge = false;
   }
 
-  std::string fname = TableFileName(dbname, meta->number);
+  std::string fname = TableFileName(ioptions.db_paths, meta->fd.GetNumber(),
+                                    meta->fd.GetPathId());
   if (iter->Valid()) {
     unique_ptr<WritableFile> file;
-    s = env->NewWritableFile(fname, &file, soptions);
+    s = env->NewWritableFile(fname, &file, env_options);
     if (!s.ok()) {
       return s;
     }
+    file->SetIOPriority(io_priority);
 
-    TableBuilder* builder = GetTableBuilder(options, file.get(),
-                                            compression);
+    TableBuilder* builder = NewTableBuilder(
+        ioptions, internal_comparator, file.get(),
+        compression, compression_opts);
 
-    // the first key is the smallest key
-    Slice key = iter->key();
-    meta->smallest.DecodeFrom(key);
-    meta->smallest_seqno = GetInternalKeySeqno(key);
-    meta->largest_seqno = meta->smallest_seqno;
+    {
+      // the first key is the smallest key
+      Slice key = iter->key();
+      meta->smallest.DecodeFrom(key);
+      meta->smallest_seqno = GetInternalKeySeqno(key);
+      meta->largest_seqno = meta->smallest_seqno;
+    }
 
-    MergeHelper merge(user_comparator, options.merge_operator.get(),
-                      options.info_log.get(),
+    MergeHelper merge(internal_comparator.user_comparator(),
+                      ioptions.merge_operator, ioptions.info_log,
+                      ioptions.min_partial_merge_operands,
                       true /* internal key corruption is not ok */);
 
     if (purge) {
@@ -103,14 +111,21 @@ Status BuildTable(const std::string& dbname,
         // If the key is the same as the previous key (and it is not the
         // first key), then we skip it, since it is an older version.
         // Otherwise we output the key and mark it as the "new" previous key.
-        if (!is_first_key && !user_comparator->Compare(prev_ikey.user_key,
-                                                       this_ikey.user_key)) {
+        if (!is_first_key && !internal_comparator.user_comparator()->Compare(
+                                  prev_ikey.user_key, this_ikey.user_key)) {
           // seqno within the same key are in decreasing order
           assert(this_ikey.sequence < prev_ikey.sequence);
         } else {
           is_first_key = false;
 
           if (this_ikey.type == kTypeMerge) {
+            // TODO(tbd): Add a check here to prevent RocksDB from crash when
+            // reopening a DB w/o properly specifying the merge operator.  But
+            // currently we observed a memory leak on failing in RocksDB
+            // recovery, so we decide to let it crash instead of causing
+            // memory leak for now before we have identified the real cause
+            // of the memory leak.
+
             // Handle merge-type keys using the MergeHelper
             // TODO: pass statistics to MergeUntil
             merge.MergeUntil(iter, 0 /* don't worry about snapshot */);
@@ -178,8 +193,8 @@ Status BuildTable(const std::string& dbname,
     if (s.ok()) {
       s = builder->Finish();
       if (s.ok()) {
-        meta->file_size = builder->FileSize();
-        assert(meta->file_size > 0);
+        meta->fd.file_size = builder->FileSize();
+        assert(meta->fd.GetFileSize() > 0);
       }
     } else {
       builder->Abandon();
@@ -187,12 +202,12 @@ Status BuildTable(const std::string& dbname,
     delete builder;
 
     // Finish and check for file errors
-    if (s.ok() && !options.disableDataSync) {
-      if (options.use_fsync) {
-        StopWatch sw(env, options.statistics.get(), TABLE_SYNC_MICROS);
+    if (s.ok() && !ioptions.disable_data_sync) {
+      if (ioptions.use_fsync) {
+        StopWatch sw(env, ioptions.statistics, TABLE_SYNC_MICROS);
         s = file->Fsync();
       } else {
-        StopWatch sw(env, options.statistics.get(), TABLE_SYNC_MICROS);
+        StopWatch sw(env, ioptions.statistics, TABLE_SYNC_MICROS);
         s = file->Sync();
       }
     }
@@ -202,10 +217,8 @@ Status BuildTable(const std::string& dbname,
 
     if (s.ok()) {
       // Verify that the table is usable
-      Iterator* it = table_cache->NewIterator(ReadOptions(),
-                                              soptions,
-                                              meta->number,
-                                              meta->file_size);
+      Iterator* it = table_cache->NewIterator(ReadOptions(), env_options,
+                                              internal_comparator, meta->fd);
       s = it->status();
       delete it;
     }
@@ -216,7 +229,7 @@ Status BuildTable(const std::string& dbname,
     s = iter->status();
   }
 
-  if (s.ok() && meta->file_size > 0) {
+  if (s.ok() && meta->fd.GetFileSize() > 0) {
     // Keep it
   } else {
     env->DeleteFile(fname);

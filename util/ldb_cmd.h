@@ -4,6 +4,9 @@
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
 #pragma once
+
+#ifndef ROCKSDB_LITE
+
 #include <string>
 #include <iostream>
 #include <sstream>
@@ -13,14 +16,15 @@
 
 #include "db/version_set.h"
 #include "rocksdb/env.h"
-#include "rocksdb/options.h"
 #include "rocksdb/iterator.h"
+#include "rocksdb/ldb_tool.h"
+#include "rocksdb/options.h"
 #include "rocksdb/slice.h"
+#include "rocksdb/utilities/db_ttl.h"
 #include "util/logging.h"
 #include "util/ldb_cmd_execute_result.h"
 #include "util/string_util.h"
-#include "utilities/utility_db.h"
-#include "utilities/ttl/db_ttl.h"
+#include "utilities/ttl/db_ttl_impl.h"
 
 using std::string;
 using std::map;
@@ -45,6 +49,7 @@ public:
   static const string ARG_TO;
   static const string ARG_MAX_KEYS;
   static const string ARG_BLOOM_BITS;
+  static const string ARG_FIX_PREFIX_LEN;
   static const string ARG_COMPRESSION_TYPE;
   static const string ARG_BLOCK_SIZE;
   static const string ARG_AUTO_COMPACTION;
@@ -54,21 +59,27 @@ public:
 
   static LDBCommand* InitFromCmdLineArgs(
     const vector<string>& args,
-    const Options& options = Options()
+    const Options& options,
+    const LDBOptions& ldb_options
   );
 
   static LDBCommand* InitFromCmdLineArgs(
     int argc,
     char** argv,
-    const Options& options = Options()
+    const Options& options,
+    const LDBOptions& ldb_options
   );
 
   bool ValidateCmdLineOptions();
 
   virtual Options PrepareOptionsForOpenDB();
 
-  virtual void SetOptions(Options options) {
+  virtual void SetDBOptions(Options options) {
     options_ = options;
+  }
+
+  void SetLDBOptions(const LDBOptions& ldb_options) {
+    ldb_options_ = ldb_options;
   }
 
   virtual bool NoDBOpen() {
@@ -149,7 +160,7 @@ protected:
   LDBCommandExecuteResult exec_state_;
   string db_path_;
   DB* db_;
-  StackableDB* sdb_;
+  DBWithTTL* db_ttl_;
 
   /**
    * true implies that this command can work if the db is opened in read-only
@@ -217,11 +228,11 @@ protected:
     Status st;
     if (is_db_ttl_) {
       if (is_read_only_) {
-        st = UtilityDB::OpenTtlDB(opt, db_path_, &sdb_, 0, true);
+        st = DBWithTTL::Open(opt, db_path_, &db_ttl_, 0, true);
       } else {
-        st = UtilityDB::OpenTtlDB(opt, db_path_, &sdb_);
+        st = DBWithTTL::Open(opt, db_path_, &db_ttl_);
       }
-      db_ = sdb_;
+      db_ = db_ttl_;
     } else if (is_read_only_) {
       st = DB::OpenForReadOnly(opt, db_path_, &db_);
     } else {
@@ -277,9 +288,10 @@ protected:
    * passed in.
    */
   vector<string> BuildCmdLineOptions(vector<string> options) {
-    vector<string> ret = {ARG_DB, ARG_BLOOM_BITS, ARG_BLOCK_SIZE,
-                          ARG_AUTO_COMPACTION, ARG_COMPRESSION_TYPE,
-                          ARG_WRITE_BUFFER_SIZE, ARG_FILE_SIZE};
+    vector<string> ret = {ARG_DB,               ARG_BLOOM_BITS,
+                          ARG_BLOCK_SIZE,       ARG_AUTO_COMPACTION,
+                          ARG_COMPRESSION_TYPE, ARG_WRITE_BUFFER_SIZE,
+                          ARG_FILE_SIZE,        ARG_FIX_PREFIX_LEN};
     ret.insert(ret.end(), options.begin(), options.end());
     return ret;
   }
@@ -291,6 +303,7 @@ protected:
                          const string& option, string* value);
 
   Options options_;
+  LDBOptions ldb_options_;
 
 private:
 
@@ -482,6 +495,23 @@ private:
 
   static const string ARG_VERBOSE;
   static const string ARG_PATH;
+};
+
+class ListColumnFamiliesCommand : public LDBCommand {
+ public:
+  static string Name() { return "list_column_families"; }
+
+  ListColumnFamiliesCommand(const vector<string>& params,
+                            const map<string, string>& options,
+                            const vector<string>& flags);
+
+  static void Help(string& ret);
+  virtual void DoCommand();
+
+  virtual bool NoDBOpen() { return true; }
+
+ private:
+  string dbname_;
 };
 
 class ReduceDBLevelsCommand : public LDBCommand {
@@ -686,4 +716,22 @@ private:
   static const char* DELETE_CMD;
 };
 
+class CheckConsistencyCommand : public LDBCommand {
+public:
+  static string Name() { return "checkconsistency"; }
+
+  CheckConsistencyCommand(const vector<string>& params,
+      const map<string, string>& options, const vector<string>& flags);
+
+  virtual void DoCommand();
+
+  virtual bool NoDBOpen() {
+    return true;
+  }
+
+  static void Help(string& ret);
+};
+
 } // namespace rocksdb
+
+#endif  // ROCKSDB_LITE

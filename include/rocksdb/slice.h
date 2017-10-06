@@ -105,8 +105,9 @@ class Slice {
 // A set of Slices that are virtually concatenated together.  'parts' points
 // to an array of Slices.  The number of elements in the array is 'num_parts'.
 struct SliceParts {
-  SliceParts(const Slice* parts, int num_parts) :
-      parts(parts), num_parts(num_parts) { }
+  SliceParts(const Slice* _parts, int _num_parts) :
+      parts(_parts), num_parts(_num_parts) { }
+  SliceParts() : parts(nullptr), num_parts(0) {}
 
   const Slice* parts;
   int num_parts;
@@ -122,7 +123,7 @@ inline bool operator!=(const Slice& x, const Slice& y) {
 }
 
 inline int Slice::compare(const Slice& b) const {
-  const int min_len = (size_ < b.size_) ? size_ : b.size_;
+  const size_t min_len = (size_ < b.size_) ? size_ : b.size_;
   int r = memcmp(data_, b.data_, min_len);
   if (r == 0) {
     if (size_ < b.size_) r = -1;

@@ -8,7 +8,11 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include "rocksdb/env.h"
+
+#include <sys/time.h>
 #include "rocksdb/options.h"
+#include "util/arena.h"
+#include "util/autovector.h"
 
 namespace rocksdb {
 
@@ -37,10 +41,63 @@ void LogFlush(Logger *info_log) {
 }
 
 void Log(Logger* info_log, const char* format, ...) {
-  if (info_log) {
+  if (info_log && info_log->GetInfoLogLevel() <= InfoLogLevel::INFO_LEVEL) {
     va_list ap;
     va_start(ap, format);
-    info_log->Logv(format, ap);
+    info_log->Logv(InfoLogLevel::INFO_LEVEL, format, ap);
+    va_end(ap);
+  }
+}
+
+void Log(const InfoLogLevel log_level, Logger* info_log, const char* format,
+         ...) {
+  if (info_log && info_log->GetInfoLogLevel() <= log_level) {
+    va_list ap;
+    va_start(ap, format);
+    info_log->Logv(log_level, format, ap);
+    va_end(ap);
+  }
+}
+
+void Debug(Logger* info_log, const char* format, ...) {
+  if (info_log && info_log->GetInfoLogLevel() <= InfoLogLevel::DEBUG_LEVEL) {
+    va_list ap;
+    va_start(ap, format);
+    info_log->Logv(InfoLogLevel::DEBUG_LEVEL, format, ap);
+    va_end(ap);
+  }
+}
+
+void Info(Logger* info_log, const char* format, ...) {
+  if (info_log && info_log->GetInfoLogLevel() <= InfoLogLevel::INFO_LEVEL) {
+    va_list ap;
+    va_start(ap, format);
+    info_log->Logv(InfoLogLevel::INFO_LEVEL, format, ap);
+    va_end(ap);
+  }
+}
+
+void Warn(Logger* info_log, const char* format, ...) {
+  if (info_log && info_log->GetInfoLogLevel() <= InfoLogLevel::WARN_LEVEL) {
+    va_list ap;
+    va_start(ap, format);
+    info_log->Logv(InfoLogLevel::WARN_LEVEL, format, ap);
+    va_end(ap);
+  }
+}
+void Error(Logger* info_log, const char* format, ...) {
+  if (info_log && info_log->GetInfoLogLevel() <= InfoLogLevel::ERROR_LEVEL) {
+    va_list ap;
+    va_start(ap, format);
+    info_log->Logv(InfoLogLevel::ERROR_LEVEL, format, ap);
+    va_end(ap);
+  }
+}
+void Fatal(Logger* info_log, const char* format, ...) {
+  if (info_log && info_log->GetInfoLogLevel() <= InfoLogLevel::FATAL_LEVEL) {
+    va_list ap;
+    va_start(ap, format);
+    info_log->Logv(InfoLogLevel::FATAL_LEVEL, format, ap);
     va_end(ap);
   }
 }
@@ -51,18 +108,72 @@ void LogFlush(const shared_ptr<Logger>& info_log) {
   }
 }
 
-void Log(const shared_ptr<Logger>& info_log, const char* format, ...) {
+void Log(const InfoLogLevel log_level, const shared_ptr<Logger>& info_log,
+         const char* format, ...) {
   if (info_log) {
     va_list ap;
     va_start(ap, format);
-    info_log->Logv(format, ap);
+    info_log->Logv(log_level, format, ap);
     va_end(ap);
   }
 }
 
-static Status DoWriteStringToFile(Env* env, const Slice& data,
-                                  const std::string& fname,
-                                  bool should_sync) {
+void Debug(const shared_ptr<Logger>& info_log, const char* format, ...) {
+  if (info_log) {
+    va_list ap;
+    va_start(ap, format);
+    info_log->Logv(InfoLogLevel::DEBUG_LEVEL, format, ap);
+    va_end(ap);
+  }
+}
+
+void Info(const shared_ptr<Logger>& info_log, const char* format, ...) {
+  if (info_log) {
+    va_list ap;
+    va_start(ap, format);
+    info_log->Logv(InfoLogLevel::INFO_LEVEL, format, ap);
+    va_end(ap);
+  }
+}
+
+void Warn(const shared_ptr<Logger>& info_log, const char* format, ...) {
+  if (info_log) {
+    va_list ap;
+    va_start(ap, format);
+    info_log->Logv(InfoLogLevel::WARN_LEVEL, format, ap);
+    va_end(ap);
+  }
+}
+
+void Error(const shared_ptr<Logger>& info_log, const char* format, ...) {
+  if (info_log) {
+    va_list ap;
+    va_start(ap, format);
+    info_log->Logv(InfoLogLevel::ERROR_LEVEL, format, ap);
+    va_end(ap);
+  }
+}
+
+void Fatal(const shared_ptr<Logger>& info_log, const char* format, ...) {
+  if (info_log) {
+    va_list ap;
+    va_start(ap, format);
+    info_log->Logv(InfoLogLevel::FATAL_LEVEL, format, ap);
+    va_end(ap);
+  }
+}
+
+void Log(const shared_ptr<Logger>& info_log, const char* format, ...) {
+  if (info_log) {
+    va_list ap;
+    va_start(ap, format);
+    info_log->Logv(InfoLogLevel::INFO_LEVEL, format, ap);
+    va_end(ap);
+  }
+}
+
+Status WriteStringToFile(Env* env, const Slice& data, const std::string& fname,
+                         bool should_sync) {
   unique_ptr<WritableFile> file;
   EnvOptions soptions;
   Status s = env->NewWritableFile(fname, &file, soptions);
@@ -77,16 +188,6 @@ static Status DoWriteStringToFile(Env* env, const Slice& data,
     env->DeleteFile(fname);
   }
   return s;
-}
-
-Status WriteStringToFile(Env* env, const Slice& data,
-                         const std::string& fname) {
-  return DoWriteStringToFile(env, data, fname, false);
-}
-
-Status WriteStringToFileSync(Env* env, const Slice& data,
-                             const std::string& fname) {
-  return DoWriteStringToFile(env, data, fname, true);
 }
 
 Status ReadFileToString(Env* env, const std::string& fname, std::string* data) {
@@ -119,22 +220,31 @@ EnvWrapper::~EnvWrapper() {
 
 namespace {  // anonymous namespace
 
-void AssignEnvOptions(EnvOptions* env_options, const Options& options) {
+void AssignEnvOptions(EnvOptions* env_options, const DBOptions& options) {
   env_options->use_os_buffer = options.allow_os_buffer;
   env_options->use_mmap_reads = options.allow_mmap_reads;
   env_options->use_mmap_writes = options.allow_mmap_writes;
   env_options->set_fd_cloexec = options.is_fd_close_on_exec;
   env_options->bytes_per_sync = options.bytes_per_sync;
+  env_options->rate_limiter = options.rate_limiter.get();
 }
 
 }
 
-EnvOptions::EnvOptions(const Options& options) {
+EnvOptions Env::OptimizeForLogWrite(const EnvOptions& env_options) const {
+  return env_options;
+}
+
+EnvOptions Env::OptimizeForManifestWrite(const EnvOptions& env_options) const {
+  return env_options;
+}
+
+EnvOptions::EnvOptions(const DBOptions& options) {
   AssignEnvOptions(this, options);
 }
 
 EnvOptions::EnvOptions() {
-  Options options;
+  DBOptions options;
   AssignEnvOptions(this, options);
 }
 

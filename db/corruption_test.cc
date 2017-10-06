@@ -40,12 +40,14 @@ class CorruptionTest {
   CorruptionTest() {
     tiny_cache_ = NewLRUCache(100);
     options_.env = &env_;
-    dbname_ = test::TmpDir() + "/db_test";
+    dbname_ = test::TmpDir() + "/corruption_test";
     DestroyDB(dbname_, options_);
 
     db_ = nullptr;
     options_.create_if_missing = true;
-    options_.block_size_deviation = 0; // make unit test pass for now
+    BlockBasedTableOptions table_options;
+    table_options.block_size_deviation = 0;  // make unit test pass for now
+    options_.table_factory.reset(NewBlockBasedTableFactory(table_options));
     Reopen();
     options_.create_if_missing = false;
   }
@@ -60,9 +62,11 @@ class CorruptionTest {
     db_ = nullptr;
     Options opt = (options ? *options : options_);
     opt.env = &env_;
-    opt.block_cache = tiny_cache_;
-    opt.block_size_deviation = 0;
     opt.arena_block_size = 4096;
+    BlockBasedTableOptions table_options;
+    table_options.block_cache = tiny_cache_;
+    table_options.block_size_deviation = 0;
+    opt.table_factory.reset(NewBlockBasedTableFactory(table_options));
     return DB::Open(opt, dbname_, &db_);
   }
 
@@ -95,7 +99,12 @@ class CorruptionTest {
     int bad_values = 0;
     int correct = 0;
     std::string value_space;
-    Iterator* iter = db_->NewIterator(ReadOptions());
+    // Do not verify checksums. If we verify checksums then the
+    // db itself will raise errors because data is corrupted.
+    // Instead, we want the reads to be successful and this test
+    // will detect whether the appropriate corruptions have
+    // occured.
+    Iterator* iter = db_->NewIterator(ReadOptions(false, true));
     for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
       uint64_t key;
       Slice in(iter->key());
@@ -106,8 +115,8 @@ class CorruptionTest {
         continue;
       }
       missed += (key - next_expected);
-      next_expected = key + 1;
-      if (iter->value() != Value(key, &value_space)) {
+      next_expected = static_cast<unsigned int>(key + 1);
+      if (iter->value() != Value(static_cast<int>(key), &value_space)) {
         bad_values++;
       } else {
         correct++;
@@ -122,24 +131,7 @@ class CorruptionTest {
     ASSERT_GE(max_expected, correct);
   }
 
-  void Corrupt(FileType filetype, int offset, int bytes_to_corrupt) {
-    // Pick file to corrupt
-    std::vector<std::string> filenames;
-    ASSERT_OK(env_.GetChildren(dbname_, &filenames));
-    uint64_t number;
-    FileType type;
-    std::string fname;
-    int picked_number = -1;
-    for (unsigned int i = 0; i < filenames.size(); i++) {
-      if (ParseFileName(filenames[i], &number, &type) &&
-          type == filetype &&
-          int(number) > picked_number) {  // Pick latest file
-        fname = dbname_ + "/" + filenames[i];
-        picked_number = number;
-      }
-    }
-    ASSERT_TRUE(!fname.empty()) << filetype;
-
+  void CorruptFile(const std::string& fname, int offset, int bytes_to_corrupt) {
     struct stat sbuf;
     if (stat(fname.c_str(), &sbuf) != 0) {
       const char* msg = strerror(errno);
@@ -151,14 +143,14 @@ class CorruptionTest {
       if (-offset > sbuf.st_size) {
         offset = 0;
       } else {
-        offset = sbuf.st_size + offset;
+        offset = static_cast<int>(sbuf.st_size + offset);
       }
     }
     if (offset > sbuf.st_size) {
-      offset = sbuf.st_size;
+      offset = static_cast<int>(sbuf.st_size);
     }
     if (offset + bytes_to_corrupt > sbuf.st_size) {
-      bytes_to_corrupt = sbuf.st_size - offset;
+      bytes_to_corrupt = static_cast<int>(sbuf.st_size - offset);
     }
 
     // Do it
@@ -171,6 +163,42 @@ class CorruptionTest {
     s = WriteStringToFile(Env::Default(), contents, fname);
     ASSERT_TRUE(s.ok()) << s.ToString();
   }
+
+  void Corrupt(FileType filetype, int offset, int bytes_to_corrupt) {
+    // Pick file to corrupt
+    std::vector<std::string> filenames;
+    ASSERT_OK(env_.GetChildren(dbname_, &filenames));
+    uint64_t number;
+    FileType type;
+    std::string fname;
+    int picked_number = -1;
+    for (unsigned int i = 0; i < filenames.size(); i++) {
+      if (ParseFileName(filenames[i], &number, &type) &&
+          type == filetype &&
+          static_cast<int>(number) > picked_number) {  // Pick latest file
+        fname = dbname_ + "/" + filenames[i];
+        picked_number = static_cast<int>(number);
+      }
+    }
+    ASSERT_TRUE(!fname.empty()) << filetype;
+
+    CorruptFile(fname, offset, bytes_to_corrupt);
+  }
+
+  // corrupts exactly one file at level `level`. if no file found at level,
+  // asserts
+  void CorruptTableFileAtLevel(int level, int offset, int bytes_to_corrupt) {
+    std::vector<LiveFileMetaData> metadata;
+    db_->GetLiveFilesMetaData(&metadata);
+    for (const auto& m : metadata) {
+      if (m.level == level) {
+        CorruptFile(dbname_ + "/" + m.name, offset, bytes_to_corrupt);
+        return;
+      }
+    }
+    ASSERT_TRUE(false) << "no file found at level";
+  }
+
 
   int Property(const std::string& name) {
     std::string property;
@@ -218,7 +246,8 @@ TEST(CorruptionTest, RecoverWriteError) {
 TEST(CorruptionTest, NewFileErrorDuringWrite) {
   // Do enough writing to force minor compaction
   env_.writable_file_error_ = true;
-  const int num = 3 + (Options().write_buffer_size / kValueSize);
+  const int num =
+      static_cast<int>(3 + (Options().write_buffer_size / kValueSize));
   std::string value_storage;
   Status s;
   bool failed = false;
@@ -304,6 +333,9 @@ TEST(CorruptionTest, CorruptedDescriptor) {
 }
 
 TEST(CorruptionTest, CompactionInputError) {
+  Options options;
+  options.max_background_flushes = 0;
+  Reopen(&options);
   Build(10);
   DBImpl* dbi = reinterpret_cast<DBImpl*>(db_);
   dbi->TEST_FlushMemTable();
@@ -321,30 +353,36 @@ TEST(CorruptionTest, CompactionInputError) {
 TEST(CorruptionTest, CompactionInputErrorParanoid) {
   Options options;
   options.paranoid_checks = true;
-  options.write_buffer_size = 1048576;
+  options.write_buffer_size = 131072;
+  options.max_write_buffer_number = 2;
+  options.max_background_flushes = 0;
   Reopen(&options);
   DBImpl* dbi = reinterpret_cast<DBImpl*>(db_);
 
-  // Fill levels >= 1 so memtable compaction outputs to level 1
+  // Fill levels >= 1 so memtable flush outputs to level 0
   for (int level = 1; level < dbi->NumberLevels(); level++) {
     dbi->Put(WriteOptions(), "", "begin");
     dbi->Put(WriteOptions(), "~", "end");
     dbi->TEST_FlushMemTable();
   }
 
+  options.max_mem_compaction_level = 0;
+  Reopen(&options);
+
+  dbi = reinterpret_cast<DBImpl*>(db_);
   Build(10);
   dbi->TEST_FlushMemTable();
   dbi->TEST_WaitForCompact();
   ASSERT_EQ(1, Property("rocksdb.num-files-at-level0"));
 
-  Corrupt(kTableFile, 100, 1);
+  CorruptTableFileAtLevel(0, 100, 1);
   Check(9, 9);
 
   // Write must eventually fail because of corrupted table
   Status s;
   std::string tmp1, tmp2;
   bool failed = false;
-  for (int i = 0; i < 10000 && s.ok(); i++) {
+  for (int i = 0; i < 10000; i++) {
     s = db_->Put(WriteOptions(), Key(i, &tmp1), Value(i, &tmp2));
     if (!s.ok()) {
       failed = true;
@@ -369,6 +407,39 @@ TEST(CorruptionTest, UnrelatedKeys) {
   dbi->TEST_FlushMemTable();
   ASSERT_OK(db_->Get(ReadOptions(), Key(1000, &tmp1), &v));
   ASSERT_EQ(Value(1000, &tmp2).ToString(), v);
+}
+
+TEST(CorruptionTest, FileSystemStateCorrupted) {
+  for (int iter = 0; iter < 2; ++iter) {
+    Options options;
+    options.paranoid_checks = true;
+    options.create_if_missing = true;
+    Reopen(&options);
+    Build(10);
+    ASSERT_OK(db_->Flush(FlushOptions()));
+    DBImpl* dbi = reinterpret_cast<DBImpl*>(db_);
+    std::vector<LiveFileMetaData> metadata;
+    dbi->GetLiveFilesMetaData(&metadata);
+    ASSERT_GT(metadata.size(), size_t(0));
+    std::string filename = dbname_ + metadata[0].name;
+
+    delete db_;
+    db_ = nullptr;
+
+    if (iter == 0) {  // corrupt file size
+      unique_ptr<WritableFile> file;
+      env_.NewWritableFile(filename, &file, EnvOptions());
+      file->Append(Slice("corrupted sst"));
+      file.reset();
+    } else {  // delete the file
+      env_.DeleteFile(filename);
+    }
+
+    Status x = TryReopen(&options);
+    ASSERT_TRUE(x.IsCorruption());
+    DestroyDB(dbname_, options_);
+    Reopen(&options);
+  }
 }
 
 }  // namespace rocksdb

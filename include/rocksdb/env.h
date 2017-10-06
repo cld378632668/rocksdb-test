@@ -20,6 +20,7 @@
 #include <cstdarg>
 #include <string>
 #include <memory>
+#include <limits>
 #include <vector>
 #include <stdint.h>
 #include "rocksdb/status.h"
@@ -34,7 +35,8 @@ class Slice;
 class WritableFile;
 class RandomRWFile;
 class Directory;
-struct Options;
+struct DBOptions;
+class RateLimiter;
 
 using std::unique_ptr;
 using std::shared_ptr;
@@ -47,7 +49,7 @@ struct EnvOptions {
   EnvOptions();
 
   // construct from Options
-  explicit EnvOptions(const Options& options);
+  explicit EnvOptions(const DBOptions& options);
 
   // If true, then allow caching of data in environment buffers
   bool use_os_buffer = true;
@@ -59,13 +61,24 @@ struct EnvOptions {
   bool use_mmap_writes = true;
 
   // If true, set the FD_CLOEXEC on open fd.
-  bool set_fd_cloexec= true;
+  bool set_fd_cloexec = true;
 
   // Allows OS to incrementally sync files to disk while they are being
   // written, in the background. Issue one request for every bytes_per_sync
   // written. 0 turns it off.
   // Default: 0
   uint64_t bytes_per_sync = 0;
+
+  // If true, we will preallocate the file with FALLOC_FL_KEEP_SIZE flag, which
+  // means that file size won't change as part of preallocation.
+  // If false, preallocation will also change the file size. This option will
+  // improve the performance in workloads where you sync the data on every
+  // write. By default, we set it to true for MANIFEST writes and false for
+  // WAL writes
+  bool fallocate_with_keep_size = true;
+
+  // If not nullptr, write rate limiting is enabled for flush and compaction
+  RateLimiter* rate_limiter = nullptr;
 };
 
 class Env {
@@ -186,7 +199,15 @@ class Env {
   // REQUIRES: lock has not already been unlocked.
   virtual Status UnlockFile(FileLock* lock) = 0;
 
+  // Priority for scheduling job in thread pool
   enum Priority { LOW, HIGH, TOTAL };
+
+  // Priority for requesting bytes in rate limiter scheduler
+  enum IOPriority {
+    IO_LOW = 0,
+    IO_HIGH = 1,
+    IO_TOTAL = 2
+  };
 
   // Arrange to run "(*function)(arg)" once in a background thread, in
   // the thread pool specified by pri. By default, jobs go to the 'LOW'
@@ -204,6 +225,14 @@ class Env {
   // Start a new thread, invoking "function(arg)" within the new thread.
   // When "function(arg)" returns, the thread will be destroyed.
   virtual void StartThread(void (*function)(void* arg), void* arg) = 0;
+
+  // Wait for all threads started by StartThread to terminate.
+  virtual void WaitForJoin() {}
+
+  // Get thread pool queue length for specific thrad pool.
+  virtual unsigned int GetThreadPoolQueueLen(Priority pri = LOW) const {
+    return 0;
+  }
 
   // *path is set to a temporary directory that can be used for testing. It may
   // or many not have just been created. The directory may or may not differ
@@ -244,11 +273,29 @@ class Env {
   // default number: 1
   virtual void SetBackgroundThreads(int number, Priority pri = LOW) = 0;
 
+  // Enlarge number of background worker threads of a specific thread pool
+  // for this environment if it is smaller than specified. 'LOW' is the default
+  // pool.
+  virtual void IncBackgroundThreadsIfNeeded(int number, Priority pri) = 0;
+
+  // Lower IO priority for threads from the specified pool.
+  virtual void LowerThreadPoolIOPriority(Priority pool = LOW) {}
+
   // Converts seconds-since-Jan-01-1970 to a printable string
   virtual std::string TimeToString(uint64_t time) = 0;
 
   // Generates a unique id that can be used to identify a db
   virtual std::string GenerateUniqueId();
+
+  // OptimizeForLogWrite will create a new EnvOptions object that is a copy of
+  // the EnvOptions in the parameters, but is optimized for writing log files.
+  // Default implementation returns the copy of the same object.
+  virtual EnvOptions OptimizeForLogWrite(const EnvOptions& env_options) const;
+  // OptimizeForManifestWrite will create a new EnvOptions object that is a copy
+  // of the EnvOptions in the parameters, but is optimized for writing manifest
+  // files. Default implementation returns the copy of the same object.
+  virtual EnvOptions OptimizeForManifestWrite(const EnvOptions& env_options)
+      const;
 
  private:
   // No copying allowed
@@ -345,7 +392,10 @@ class RandomAccessFile {
 // at a time to the file.
 class WritableFile {
  public:
-  WritableFile() : last_preallocated_block_(0), preallocation_block_size_ (0) {
+  WritableFile()
+    : last_preallocated_block_(0),
+      preallocation_block_size_(0),
+      io_priority_(Env::IO_TOTAL) {
   }
   virtual ~WritableFile();
 
@@ -362,6 +412,14 @@ class WritableFile {
    */
   virtual Status Fsync() {
     return Sync();
+  }
+
+  /*
+   * Change the priority in rate limiter if rate limiting is enabled.
+   * If rate limiting is not enabled, this call has no effect.
+   */
+  virtual void SetIOPriority(Env::IOPriority pri) {
+    io_priority_ = pri;
   }
 
   /*
@@ -419,8 +477,8 @@ class WritableFile {
     if (new_last_preallocated_block > last_preallocated_block_) {
       size_t num_spanned_blocks =
         new_last_preallocated_block - last_preallocated_block_;
-      Allocate(block_size * last_preallocated_block_,
-               block_size * num_spanned_blocks);
+      Allocate(static_cast<off_t>(block_size * last_preallocated_block_),
+               static_cast<off_t>(block_size * num_spanned_blocks));
       last_preallocated_block_ = new_last_preallocated_block;
     }
   }
@@ -448,6 +506,9 @@ class WritableFile {
   // No copying allowed
   WritableFile(const WritableFile&);
   void operator=(const WritableFile&);
+
+ protected:
+  Env::IOPriority io_priority_;
 };
 
 // A file abstraction for random reading and writing.
@@ -508,25 +569,65 @@ class Directory {
   virtual Status Fsync() = 0;
 };
 
+enum InfoLogLevel : unsigned char {
+  DEBUG_LEVEL = 0,
+  INFO_LEVEL,
+  WARN_LEVEL,
+  ERROR_LEVEL,
+  FATAL_LEVEL,
+  NUM_INFO_LOG_LEVELS,
+};
+
 // An interface for writing log messages.
 class Logger {
  public:
-  enum { DO_NOT_SUPPORT_GET_LOG_FILE_SIZE = -1 };
-  Logger() { }
+  size_t kDoNotSupportGetLogFileSize = std::numeric_limits<size_t>::max();
+
+  explicit Logger(const InfoLogLevel log_level = InfoLogLevel::INFO_LEVEL)
+      : log_level_(log_level) {}
   virtual ~Logger();
 
   // Write an entry to the log file with the specified format.
   virtual void Logv(const char* format, va_list ap) = 0;
-  virtual size_t GetLogFileSize() const {
-    return DO_NOT_SUPPORT_GET_LOG_FILE_SIZE;
+
+  // Write an entry to the log file with the specified log level
+  // and format.  Any log with level under the internal log level
+  // of *this (see @SetInfoLogLevel and @GetInfoLogLevel) will not be
+  // printed.
+  void Logv(const InfoLogLevel log_level, const char* format, va_list ap) {
+    static const char* kInfoLogLevelNames[5] = {"DEBUG", "INFO", "WARN",
+                                                "ERROR", "FATAL"};
+    if (log_level < log_level_) {
+      return;
+    }
+
+    if (log_level == InfoLogLevel::INFO_LEVEL) {
+      // Doesn't print log level if it is INFO level.
+      // This is to avoid unexpected performance regression after we add
+      // the feature of log level. All the logs before we add the feature
+      // are INFO level. We don't want to add extra costs to those existing
+      // logging.
+      Logv(format, ap);
+    } else {
+      char new_format[500];
+      snprintf(new_format, sizeof(new_format) - 1, "[%s] %s",
+               kInfoLogLevelNames[log_level], format);
+      Logv(new_format, ap);
+    }
   }
+  virtual size_t GetLogFileSize() const { return kDoNotSupportGetLogFileSize; }
   // Flush to the OS buffers
   virtual void Flush() {}
+  virtual InfoLogLevel GetInfoLogLevel() const { return log_level_; }
+  virtual void SetInfoLogLevel(const InfoLogLevel log_level) {
+    log_level_ = log_level;
+  }
 
  private:
   // No copying allowed
   Logger(const Logger&);
   void operator=(const Logger&);
+  InfoLogLevel log_level_;
 };
 
 
@@ -541,10 +642,20 @@ class FileLock {
   void operator=(const FileLock&);
 };
 
-
 extern void LogFlush(const shared_ptr<Logger>& info_log);
 
+extern void Log(const InfoLogLevel log_level,
+                const shared_ptr<Logger>& info_log, const char* format, ...);
+
+// a set of log functions with different log levels.
+extern void Debug(const shared_ptr<Logger>& info_log, const char* format, ...);
+extern void Info(const shared_ptr<Logger>& info_log, const char* format, ...);
+extern void Warn(const shared_ptr<Logger>& info_log, const char* format, ...);
+extern void Error(const shared_ptr<Logger>& info_log, const char* format, ...);
+extern void Fatal(const shared_ptr<Logger>& info_log, const char* format, ...);
+
 // Log the specified data to *info_log if info_log is non-nullptr.
+// The default info log level is InfoLogLevel::ERROR.
 extern void Log(const shared_ptr<Logger>& info_log, const char* format, ...)
 #   if defined(__GNUC__) || defined(__clang__)
     __attribute__((__format__ (__printf__, 2, 3)))
@@ -553,15 +664,27 @@ extern void Log(const shared_ptr<Logger>& info_log, const char* format, ...)
 
 extern void LogFlush(Logger *info_log);
 
+extern void Log(const InfoLogLevel log_level, Logger* info_log,
+                const char* format, ...);
+
+// The default info log level is InfoLogLevel::ERROR.
 extern void Log(Logger* info_log, const char* format, ...)
 #   if defined(__GNUC__) || defined(__clang__)
     __attribute__((__format__ (__printf__, 2, 3)))
 #   endif
     ;
 
+// a set of log functions with different log levels.
+extern void Debug(Logger* info_log, const char* format, ...);
+extern void Info(Logger* info_log, const char* format, ...);
+extern void Warn(Logger* info_log, const char* format, ...);
+extern void Error(Logger* info_log, const char* format, ...);
+extern void Fatal(Logger* info_log, const char* format, ...);
+
 // A utility routine: write "data" to the named file.
 extern Status WriteStringToFile(Env* env, const Slice& data,
-                                const std::string& fname);
+                                const std::string& fname,
+                                bool should_sync = false);
 
 // A utility routine: read contents of named file into *data
 extern Status ReadFileToString(Env* env, const std::string& fname,
@@ -634,6 +757,10 @@ class EnvWrapper : public Env {
   void StartThread(void (*f)(void*), void* a) {
     return target_->StartThread(f, a);
   }
+  void WaitForJoin() { return target_->WaitForJoin(); }
+  virtual unsigned int GetThreadPoolQueueLen(Priority pri = LOW) const {
+    return target_->GetThreadPoolQueueLen(pri);
+  }
   virtual Status GetTestDirectory(std::string* path) {
     return target_->GetTestDirectory(path);
   }
@@ -660,6 +787,14 @@ class EnvWrapper : public Env {
   void SetBackgroundThreads(int num, Priority pri) {
     return target_->SetBackgroundThreads(num, pri);
   }
+
+  void IncBackgroundThreadsIfNeeded(int num, Priority pri) {
+    return target_->IncBackgroundThreadsIfNeeded(num, pri);
+  }
+
+  void LowerThreadPoolIOPriority(Priority pool = LOW) override {
+    target_->LowerThreadPoolIOPriority(pool);
+  }
   std::string TimeToString(uint64_t time) {
     return target_->TimeToString(time);
   }
@@ -667,6 +802,12 @@ class EnvWrapper : public Env {
  private:
   Env* target_;
 };
+
+// Returns a new environment that stores its data in memory and delegates
+// all non-file-storage tasks to base_env. The caller must delete the result
+// when it is no longer needed.
+// *base_env must remain live while the result is in use.
+Env* NewMemEnv(Env* base_env);
 
 }  // namespace rocksdb
 

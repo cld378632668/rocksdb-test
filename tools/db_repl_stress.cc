@@ -2,17 +2,25 @@
 //  This source code is licensed under the BSD-style license found in the
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
-//
+
+#ifndef ROCKSDB_LITE
+#ifndef GFLAGS
 #include <cstdio>
+int main() {
+  fprintf(stderr, "Please install gflags to run rocksdb tools\n");
+  return 1;
+}
+#else
+
+#include <cstdio>
+#include <atomic>
 
 #include <gflags/gflags.h>
 
 #include "db/write_batch_internal.h"
 #include "rocksdb/db.h"
 #include "rocksdb/types.h"
-#include "port/atomic_pointer.h"
 #include "util/testutil.h"
-
 
 // Run a thread to perform Put's.
 // Another thread uses GetUpdatesSince API to keep getting the updates.
@@ -21,6 +29,9 @@
 // --wal_ttl = the wal ttl for the run.
 
 using namespace rocksdb;
+
+using GFLAGS::ParseCommandLineFlags;
+using GFLAGS::SetUsageMessage;
 
 struct DataPumpThread {
   size_t no_records;
@@ -48,7 +59,7 @@ static void DataPumpThreadBody(void* arg) {
 }
 
 struct ReplicationThread {
-  port::AtomicPointer stop;
+  std::atomic<bool> stop;
   DB* db;
   volatile size_t no_read;
 };
@@ -58,11 +69,11 @@ static void ReplicationThreadBody(void* arg) {
   DB* db = t->db;
   unique_ptr<TransactionLogIterator> iter;
   SequenceNumber currentSeqNum = 1;
-  while (t->stop.Acquire_Load() != nullptr) {
+  while (!t->stop.load(std::memory_order_acquire)) {
     iter.reset();
     Status s;
     while(!db->GetUpdatesSince(currentSeqNum, &iter).ok()) {
-      if (t->stop.Acquire_Load() == nullptr) {
+      if (t->stop.load(std::memory_order_acquire)) {
         return;
       }
     }
@@ -87,10 +98,11 @@ DEFINE_uint64(wal_size_limit_MB, 10, "the wal size limit for the run"
               "(in MB)");
 
 int main(int argc, const char** argv) {
-  google::SetUsageMessage(std::string("\nUSAGE:\n") + std::string(argv[0]) +
-    " --num_inserts=<num_inserts> --wal_ttl_seconds=<WAL_ttl_seconds>" +
-    " --wal_size_limit_MB=<WAL_size_limit_MB>");
-  google::ParseCommandLineFlags(&argc, const_cast<char***>(&argv), true);
+  SetUsageMessage(
+      std::string("\nUSAGE:\n") + std::string(argv[0]) +
+      " --num_inserts=<num_inserts> --wal_ttl_seconds=<WAL_ttl_seconds>" +
+      " --wal_size_limit_MB=<WAL_size_limit_MB>");
+  ParseCommandLineFlags(&argc, const_cast<char***>(&argv), true);
 
   Env* env = Env::Default();
   std::string default_db_path;
@@ -118,17 +130,27 @@ int main(int argc, const char** argv) {
   ReplicationThread replThread;
   replThread.db = db;
   replThread.no_read = 0;
-  replThread.stop.Release_Store(env); // store something to make it non-null.
+  replThread.stop.store(false, std::memory_order_release);
 
   env->StartThread(ReplicationThreadBody, &replThread);
   while(replThread.no_read < FLAGS_num_inserts);
-  replThread.stop.Release_Store(nullptr);
+  replThread.stop.store(true, std::memory_order_release);
   if (replThread.no_read < dataPump.no_records) {
     // no. read should be => than inserted.
-    fprintf(stderr, "No. of Record's written and read not same\nRead : %ld"
-            " Written : %ld\n", replThread.no_read, dataPump.no_records);
+    fprintf(stderr, "No. of Record's written and read not same\nRead : %zu"
+            " Written : %zu\n", replThread.no_read, dataPump.no_records);
     exit(1);
   }
   fprintf(stderr, "Successful!\n");
   exit(0);
 }
+
+#endif  // GFLAGS
+
+#else  // ROCKSDB_LITE
+#include <stdio.h>
+int main(int argc, char** argv) {
+  fprintf(stderr, "Not supported in lite mode.\n");
+  return 1;
+}
+#endif  // ROCKSDB_LITE

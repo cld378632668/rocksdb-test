@@ -1,3 +1,9 @@
+//  Copyright (c) 2013, Facebook, Inc.  All rights reserved.
+//  This source code is licensed under the BSD-style license found in the
+//  LICENSE file in the root directory of this source tree. An additional grant
+//  of patent rights can be found in the PATENTS file in the same directory.
+
+#ifndef ROCKSDB_LITE
 #include <cstdio>
 #include <vector>
 #include <atomic>
@@ -23,11 +29,13 @@ uint64_t timeout_sec;
 Env *env;
 BlobStore* bs;
 
-static std::string RandomString(Random* rnd, uint64_t len) {
+namespace {
+std::string RandomString(Random* rnd, uint64_t len) {
   std::string r;
-  test::RandomString(rnd, len, &r);
+  test::RandomString(rnd, static_cast<int>(len), &r);
   return r;
 }
+}  // namespace
 
 struct Result {
   uint32_t writes;
@@ -52,18 +60,22 @@ struct Result {
     writes = reads = deletes = data_read = data_written = 0;
   }
 
-  Result (uint32_t writes, uint32_t reads, uint32_t deletes,
-          uint64_t data_written, uint64_t data_read) :
-    writes(writes), reads(reads), deletes(deletes),
-    data_written(data_written), data_read(data_read) {}
-
+  Result(uint32_t _writes, uint32_t _reads, uint32_t _deletes,
+         uint64_t _data_written, uint64_t _data_read)
+      : writes(_writes),
+        reads(_reads),
+        deletes(_deletes),
+        data_written(_data_written),
+        data_read(_data_read) {}
 };
 
+namespace {
 Result operator + (const Result &a, const Result &b) {
   return Result(a.writes + b.writes, a.reads + b.reads,
                 a.deletes + b.deletes, a.data_written + b.data_written,
                 a.data_read + b.data_read);
 }
+}  // namespace
 
 struct WorkerThread {
   uint64_t data_size_from, data_size_to;
@@ -72,11 +84,13 @@ struct WorkerThread {
   Result result;
   atomic<bool> stopped;
 
-  WorkerThread(uint64_t data_size_from, uint64_t data_size_to,
-                double read_ratio, uint64_t working_set_size) :
-    data_size_from(data_size_from), data_size_to(data_size_to),
-    read_ratio(read_ratio), working_set_size(working_set_size),
-    stopped(false) {}
+  WorkerThread(uint64_t _data_size_from, uint64_t _data_size_to,
+               double _read_ratio, uint64_t _working_set_size)
+      : data_size_from(_data_size_from),
+        data_size_to(_data_size_to),
+        read_ratio(_read_ratio),
+        working_set_size(_working_set_size),
+        stopped(false) {}
 
   WorkerThread(const WorkerThread& wt) :
     data_size_from(wt.data_size_from), data_size_to(wt.data_size_to),
@@ -131,6 +145,7 @@ static void WorkerThreadBody(void* arg) {
   t->stopped.store(true);
 }
 
+namespace {
 Result StartBenchmark(vector<WorkerThread*>& config) {
   for (auto w : config) {
     env->StartThread(WorkerThreadBody, w);
@@ -241,6 +256,7 @@ vector<WorkerThread*> SetupBenchmarkReadHeavy() {
 
   return config;
 }
+}  // namespace
 
 int main(int argc, const char** argv) {
   srand(33);
@@ -267,3 +283,10 @@ int main(int argc, const char** argv) {
 
   return 0;
 }
+#else  // ROCKSDB_LITE
+#include <stdio.h>
+int main(int argc, char** argv) {
+  fprintf(stderr, "Not supported in lite mode.\n");
+  return 1;
+}
+#endif  // ROCKSDB_LITE

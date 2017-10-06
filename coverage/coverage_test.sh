@@ -11,8 +11,8 @@ fi
 ROOT=".."
 # Fetch right version of gcov
 if [ -d /mnt/gvfs/third-party -a -z "$CXX" ]; then
-  source $ROOT/build_tools/fbcode.gcc471.sh
-  GCOV=$TOOLCHAIN_EXECUTABLES/gcc/gcc-4.7.1/cc6c9dc/bin/gcov
+  source $ROOT/build_tools/fbcode_config.sh
+  GCOV=$GCC_BASE/bin/gcov
 else
   GCOV=$(which gcov)
 fi
@@ -43,6 +43,11 @@ $GCOV --preserve-paths --relative-only --no-output $GCNO_FILES 2>/dev/null |
   python $ROOT/coverage/parse_gcov_output.py -interested-files $LATEST_FILES |
   tee -a $RECENT_REPORT &&
 echo -e "Generated coverage report for recently updated files: $RECENT_REPORT\n"
+
+# Unless otherwise specified, we'll not generate html report by default
+if [ -z "$HTML" ]; then
+  exit 0
+fi
 
 # Generate the html report. If we cannot find lcov in this machine, we'll simply
 # skip this step.

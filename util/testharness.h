@@ -12,18 +12,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sstream>
+#include <string>
+#include "port/stack_trace.h"
 #include "rocksdb/env.h"
 #include "rocksdb/slice.h"
 #include "util/random.h"
-#include "util/stack_trace.h"
 
 namespace rocksdb {
 namespace test {
 
 // Run some of the tests registered by the TEST() macro.  If the
-// environment variable "ROCKSDB_TESTS" is not set, runs all tests.
-// Otherwise, runs only the tests whose name contains the value of
-// "ROCKSDB_TESTS" as a substring.  E.g., suppose the tests are:
+// environment variable "ROCKSDB_TESTS" and "ROCKSDB_TESTS_FROM"
+// are not set, runs all tests. Otherwise, run all tests after
+// ROCKSDB_TESTS_FROM and those specified by ROCKSDB_TESTS.
+// Partial name match also works for ROCKSDB_TESTS and
+// ROCKSDB_TESTS_FROM. E.g., suppose the tests are:
 //    TEST(Foo, Hello) { ... }
 //    TEST(Foo, World) { ... }
 // ROCKSDB_TESTS=Hello will run the first test
@@ -35,7 +38,7 @@ namespace test {
 extern int RunAllTests();
 
 // Return the directory to use for temporary storage.
-extern std::string TmpDir();
+extern std::string TmpDir(Env* env = Env::Default());
 
 // Return a randomization seed for this run.  Typically returns the
 // same number on repeated invocations of this binary, but automated
@@ -59,7 +62,7 @@ class Tester {
   ~Tester() {
     if (!ok_) {
       fprintf(stderr, "%s:%d:%s\n", fname_, line_, ss_.str().c_str());
-      PrintStack(2);
+      port::PrintStack(2);
       exit(1);
     }
   }

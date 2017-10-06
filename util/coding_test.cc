@@ -41,7 +41,7 @@ TEST(Coding, Fixed64) {
   const char* p = s.data();
   for (int power = 0; power <= 63; power++) {
     uint64_t v = static_cast<uint64_t>(1) << power;
-    uint64_t actual;
+    uint64_t actual = 0;
     actual = DecodeFixed64(p);
     ASSERT_EQ(v-1, actual);
     p += sizeof(uint64_t);
@@ -90,7 +90,7 @@ TEST(Coding, Varint32) {
   const char* limit = p + s.size();
   for (uint32_t i = 0; i < (32 * 32); i++) {
     uint32_t expected = (i / 32) << (i % 32);
-    uint32_t actual;
+    uint32_t actual = 0;
     const char* start = p;
     p = GetVarint32Ptr(p, limit, &actual);
     ASSERT_TRUE(p != nullptr);
@@ -125,7 +125,7 @@ TEST(Coding, Varint64) {
   const char* limit = p + s.size();
   for (unsigned int i = 0; i < values.size(); i++) {
     ASSERT_TRUE(p < limit);
-    uint64_t actual;
+    uint64_t actual = 0;
     const char* start = p;
     p = GetVarint64Ptr(p, limit, &actual);
     ASSERT_TRUE(p != nullptr);
@@ -194,99 +194,6 @@ TEST(Coding, Strings) {
   ASSERT_TRUE(GetLengthPrefixedSlice(&input, &v));
   ASSERT_EQ(std::string(200, 'x'), v.ToString());
   ASSERT_EQ("", input.ToString());
-}
-
-TEST(Coding, BitStream) {
-  const int kNumBytes = 10;
-  char bytes[kNumBytes+1];
-  for (int i = 0; i < kNumBytes + 1; ++i) {
-      bytes[i] = '\0';
-  }
-
-  // Simple byte aligned test.
-  for (int i = 0; i < kNumBytes; ++i) {
-    BitStreamPutInt(bytes, kNumBytes, i*8, 8, 255-i);
-
-    ASSERT_EQ((unsigned char)bytes[i], (unsigned char)(255-i));
-  }
-  for (int i = 0; i < kNumBytes; ++i) {
-    ASSERT_EQ(BitStreamGetInt(bytes, kNumBytes, i*8, 8), (uint32_t)(255-i));
-  }
-  ASSERT_EQ(bytes[kNumBytes], '\0');
-
-  // Write and read back at strange offsets
-  for (int i = 0; i < kNumBytes + 1; ++i) {
-      bytes[i] = '\0';
-  }
-  for (int i = 0; i < kNumBytes; ++i) {
-    BitStreamPutInt(bytes, kNumBytes, i*5+1, 4, (i * 7) % (1 << 4));
-  }
-  for (int i = 0; i < kNumBytes; ++i) {
-    ASSERT_EQ(BitStreamGetInt(bytes, kNumBytes, i*5+1, 4),
-              (uint32_t)((i * 7) % (1 << 4)));
-  }
-  ASSERT_EQ(bytes[kNumBytes], '\0');
-
-  // Create 11011011 as a bit pattern
-  for (int i = 0; i < kNumBytes + 1; ++i) {
-      bytes[i] = '\0';
-  }
-  for (int i = 0; i < kNumBytes; ++i) {
-    BitStreamPutInt(bytes, kNumBytes, i*8, 2, 3);
-    BitStreamPutInt(bytes, kNumBytes, i*8+3, 2, 3);
-    BitStreamPutInt(bytes, kNumBytes, i*8+6, 2, 3);
-
-    ASSERT_EQ((unsigned char)bytes[i],
-              (unsigned char)(3 + (3 << 3) + (3 << 6)));
-  }
-  ASSERT_EQ(bytes[kNumBytes], '\0');
-
-
-  // Test large values
-  for (int i = 0; i < kNumBytes + 1; ++i) {
-      bytes[i] = '\0';
-  }
-  BitStreamPutInt(bytes, kNumBytes, 0, 64, (uint64_t)(-1));
-  for (int i = 0; i < 64/8; ++i) {
-    ASSERT_EQ((unsigned char)bytes[i],
-              (unsigned char)(255));
-  }
-  ASSERT_EQ(bytes[64/8], '\0');
-
-
-}
-
-TEST(Coding, BitStreamConvenienceFuncs) {
-  std::string bytes(1, '\0');
-
-  // Check that independent changes to byte are preserved.
-  BitStreamPutInt(&bytes, 0, 2, 3);
-  BitStreamPutInt(&bytes, 3, 2, 3);
-  BitStreamPutInt(&bytes, 6, 2, 3);
-  ASSERT_EQ((unsigned char)bytes[0], (unsigned char)(3 + (3 << 3) + (3 << 6)));
-  ASSERT_EQ(BitStreamGetInt(&bytes, 0, 2), 3u);
-  ASSERT_EQ(BitStreamGetInt(&bytes, 3, 2), 3u);
-  ASSERT_EQ(BitStreamGetInt(&bytes, 6, 2), 3u);
-  Slice slice(bytes);
-  ASSERT_EQ(BitStreamGetInt(&slice, 0, 2), 3u);
-  ASSERT_EQ(BitStreamGetInt(&slice, 3, 2), 3u);
-  ASSERT_EQ(BitStreamGetInt(&slice, 6, 2), 3u);
-
-  // Test overlapping crossing over byte boundaries
-  bytes = std::string(2, '\0');
-  BitStreamPutInt(&bytes, 6, 4, 15);
-  ASSERT_EQ((unsigned char)bytes[0], 3 << 6);
-  ASSERT_EQ((unsigned char)bytes[1], 3);
-  ASSERT_EQ(BitStreamGetInt(&bytes, 6, 4), 15u);
-  slice = Slice(bytes);
-  ASSERT_EQ(BitStreamGetInt(&slice, 6, 4), 15u);
-
-  // Test 64-bit number
-  bytes = std::string(64/8, '\0');
-  BitStreamPutInt(&bytes, 0, 64, (uint64_t)(-1));
-  ASSERT_EQ(BitStreamGetInt(&bytes, 0, 64), (uint64_t)(-1));
-  slice = Slice(bytes);
-  ASSERT_EQ(BitStreamGetInt(&slice, 0, 64), (uint64_t)(-1));
 }
 
 }  // namespace rocksdb

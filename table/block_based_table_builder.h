@@ -9,27 +9,31 @@
 
 #pragma once
 #include <stdint.h>
+#include <limits>
+
 #include "rocksdb/flush_block_policy.h"
 #include "rocksdb/options.h"
 #include "rocksdb/status.h"
-#include "rocksdb/table.h"
+#include "table/table_builder.h"
 
 namespace rocksdb {
 
 class BlockBuilder;
 class BlockHandle;
 class WritableFile;
-
+struct BlockBasedTableOptions;
 
 class BlockBasedTableBuilder : public TableBuilder {
  public:
   // Create a builder that will store the contents of the table it is
   // building in *file.  Does not close the file.  It is up to the
   // caller to close the file after calling Finish().
-  BlockBasedTableBuilder(const Options& options,
+  BlockBasedTableBuilder(const ImmutableCFOptions& ioptions,
+                         const BlockBasedTableOptions& table_options,
+                         const InternalKeyComparator& internal_comparator,
                          WritableFile* file,
-                         FlushBlockPolicyFactory* flush_block_policy_factory,
-                         CompressionType compression_type);
+                         const CompressionType compression_type,
+                         const CompressionOptions& compression_opts);
 
   // REQUIRES: Either Finish() or Abandon() has been called.
   ~BlockBasedTableBuilder();
@@ -63,11 +67,18 @@ class BlockBasedTableBuilder : public TableBuilder {
 
  private:
   bool ok() const { return status().ok(); }
+  // Call block's Finish() method and then write the finalize block contents to
+  // file.
   void WriteBlock(BlockBuilder* block, BlockHandle* handle);
+  // Directly write block content to the file.
+  void WriteBlock(const Slice& block_contents, BlockHandle* handle);
   void WriteRawBlock(const Slice& data, CompressionType, BlockHandle* handle);
   Status InsertBlockInCache(const Slice& block_contents,
-                         const CompressionType type, const BlockHandle* handle);
+                            const CompressionType type,
+                            const BlockHandle* handle);
   struct Rep;
+  class BlockBasedTablePropertiesCollectorFactory;
+  class BlockBasedTablePropertiesCollector;
   Rep* rep_;
 
   // Advanced operation: flush any buffered key/value pairs to file.
@@ -76,10 +87,13 @@ class BlockBasedTableBuilder : public TableBuilder {
   // REQUIRES: Finish(), Abandon() have not been called
   void Flush();
 
+  // Some compression libraries fail when the raw size is bigger than int. If
+  // uncompressed size is bigger than kCompressionSizeLimit, don't compress it
+  const uint64_t kCompressionSizeLimit = std::numeric_limits<int>::max();
+
   // No copying allowed
   BlockBasedTableBuilder(const BlockBasedTableBuilder&) = delete;
   void operator=(const BlockBasedTableBuilder&) = delete;
 };
 
 }  // namespace rocksdb
-

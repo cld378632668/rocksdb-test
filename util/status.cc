@@ -21,11 +21,10 @@ const char* Status::CopyState(const char* state) {
   return result;
 }
 
-Status::Status(Code code, const Slice& msg, const Slice& msg2) :
-    code_(code) {
-  assert(code != kOk);
-  const uint32_t len1 = msg.size();
-  const uint32_t len2 = msg2.size();
+Status::Status(Code _code, const Slice& msg, const Slice& msg2) : code_(_code) {
+  assert(code_ != kOk);
+  const uint32_t len1 = static_cast<uint32_t>(msg.size());
+  const uint32_t len2 = static_cast<uint32_t>(msg2.size());
   const uint32_t size = len1 + (len2 ? (2 + len2) : 0);
   char* result = new char[size + 4];
   memcpy(result, &size, sizeof(size));
@@ -60,7 +59,19 @@ std::string Status::ToString() const {
       type = "IO error: ";
       break;
     case kMergeInProgress:
-      type = "Merge In Progress: ";
+      type = "Merge in progress: ";
+      break;
+    case kIncomplete:
+      type = "Result incomplete: ";
+      break;
+    case kShutdownInProgress:
+      type = "Shutdown in progress: ";
+      break;
+    case kTimedOut:
+      type = "Operation timed out: ";
+      break;
+    case kAborted:
+      type = "Operation aborted: ";
       break;
     default:
       snprintf(tmp, sizeof(tmp), "Unknown code(%d): ",

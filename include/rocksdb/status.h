@@ -61,6 +61,25 @@ class Status {
   static Status Incomplete(const Slice& msg, const Slice& msg2 = Slice()) {
     return Status(kIncomplete, msg, msg2);
   }
+  static Status ShutdownInProgress() {
+    return Status(kShutdownInProgress);
+  }
+  static Status ShutdownInProgress(const Slice& msg,
+                                   const Slice& msg2 = Slice()) {
+    return Status(kShutdownInProgress, msg, msg2);
+  }
+  static Status TimedOut() {
+    return Status(kTimedOut);
+  }
+  static Status TimedOut(const Slice& msg, const Slice& msg2 = Slice()) {
+    return Status(kTimedOut, msg, msg2);
+  }
+  static Status Aborted() {
+    return Status(kAborted);
+  }
+  static Status Aborted(const Slice& msg, const Slice& msg2 = Slice()) {
+    return Status(kAborted, msg, msg2);
+  }
 
   // Returns true iff the status indicates success.
   bool ok() const { return code() == kOk; }
@@ -86,11 +105,17 @@ class Status {
   // Returns true iff the status indicates Incomplete
   bool IsIncomplete() const { return code() == kIncomplete; }
 
+  // Returns true iff the status indicates Shutdown In progress
+  bool IsShutdownInProgress() const { return code() == kShutdownInProgress; }
+
+  bool IsTimedOut() const { return code() == kTimedOut; }
+
+  bool IsAborted() const { return code() == kAborted; }
+
   // Return a string representation of this status suitable for printing.
   // Returns the string "OK" for success.
   std::string ToString() const;
 
- private:
   enum Code {
     kOk = 0,
     kNotFound = 1,
@@ -99,9 +124,16 @@ class Status {
     kInvalidArgument = 4,
     kIOError = 5,
     kMergeInProgress = 6,
-    kIncomplete = 7
+    kIncomplete = 7,
+    kShutdownInProgress = 8,
+    kTimedOut = 9,
+    kAborted = 10
   };
 
+  Code code() const {
+    return code_;
+  }
+ private:
   // A nullptr state_ (which is always the case for OK) means the message
   // is empty.
   // of the following form:
@@ -110,11 +142,8 @@ class Status {
   Code code_;
   const char* state_;
 
-  Code code() const {
-    return code_;
-  }
-  explicit Status(Code code) : code_(code), state_(nullptr) { }
-  Status(Code code, const Slice& msg, const Slice& msg2);
+  explicit Status(Code _code) : code_(_code), state_(nullptr) {}
+  Status(Code _code, const Slice& msg, const Slice& msg2);
   static const char* CopyState(const char* s);
 };
 

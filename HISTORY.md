@@ -1,5 +1,145 @@
 # Rocksdb Change Log
 
+## 3.8.0 (11/14/2014)
+
+### Public API changes
+* BackupEngine::NewBackupEngine() was deprecated; please use BackupEngine::Open() from now on.
+* BackupableDB/RestoreBackupableDB have new GarbageCollect() methods, which will clean up files from corrupt and obsolete backups.
+* BackupableDB/RestoreBackupableDB have new GetCorruptedBackups() methods which list corrupt backups.
+
+### Cleanup
+* Bunch of code cleanup, some extra warnings turned on (-Wshadow, -Wshorten-64-to-32, -Wnon-virtual-dtor)
+
+### New features
+* CompactFiles and EventListener, although they are still in experimental state
+* Full ColumnFamily support in RocksJava.
+
+## 3.7.0 (11/6/2014)
+### Public API changes
+* Introduce SetOptions() API to allow adjusting a subset of options dynamically online
+* Introduce 4 new convenient functions for converting Options from string: GetColumnFamilyOptionsFromMap(), GetColumnFamilyOptionsFromString(), GetDBOptionsFromMap(), GetDBOptionsFromString()
+* Remove WriteBatchWithIndex.Delete() overloads using SliceParts
+* When opening a DB, if options.max_background_compactions is larger than the existing low pri pool of options.env, it will enlarge it. Similarly, options.max_background_flushes is larger than the existing high pri pool of options.env, it will enlarge it.
+
+## 3.6.0 (10/7/2014)
+### Disk format changes
+* If you're using RocksDB on ARM platforms and you're using default bloom filter, there is a disk format change you need to be aware of. There are three steps you need to do when you convert to new release: 1. turn off filter policy, 2. compact the whole database, 3. turn on filter policy
+
+### Behavior changes
+* We have refactored our system of stalling writes.  Any stall-related statistics' meanings are changed. Instead of per-write stall counts, we now count stalls per-epoch, where epochs are periods between flushes and compactions. You'll find more information in our Tuning Perf Guide once we release RocksDB 3.6.
+* When disableDataSync=true, we no longer sync the MANIFEST file.
+* Add identity_as_first_hash property to CuckooTable. SST file needs to be rebuilt to be opened by reader properly.
+
+### Public API changes
+* Change target_file_size_base type to uint64_t from int.
+* Remove allow_thread_local. This feature was proved to be stable, so we are turning it always-on.
+
+## 3.5.0 (9/3/2014)
+### New Features
+* Add include/utilities/write_batch_with_index.h, providing a utilitiy class to query data out of WriteBatch when building it.
+* Move BlockBasedTable related options to BlockBasedTableOptions from Options. Change corresponding JNI interface. Options affected include:
+  no_block_cache, block_cache, block_cache_compressed, block_size, block_size_deviation, block_restart_interval, filter_policy, whole_key_filtering. filter_policy is changed to shared_ptr from a raw pointer.
+* Remove deprecated options: disable_seek_compaction and db_stats_log_interval
+* OptimizeForPointLookup() takes one parameter for block cache size. It now builds hash index, bloom filter, and block cache.
+
+### Public API changes
+* The Prefix Extractor used with V2 compaction filters is now passed user key to SliceTransform::Transform instead of unparsed RocksDB key.
+
+## 3.4.0 (8/18/2014)
+### New Features
+* Support Multiple DB paths in universal style compactions
+* Add feature of storing plain table index and bloom filter in SST file.
+* CompactRange() will never output compacted files to level 0. This used to be the case when all the compaction input files were at level 0.
+* Added iterate_upper_bound to define the extent upto which the forward iterator will return entries. This will prevent iterating over delete markers and overwritten entries for edge cases where you want to break out the iterator anyways. This may improve perfomance in case there are a large number of delete markers or overwritten entries.
+
+### Public API changes
+* DBOptions.db_paths now is a vector of a DBPath structure which indicates both of path and target size
+* NewPlainTableFactory instead of bunch of parameters now accepts PlainTableOptions, which is defined in include/rocksdb/table.h
+* Moved include/utilities/*.h to include/rocksdb/utilities/*.h
+* Statistics APIs now take uint32_t as type instead of Tickers. Also make two access functions getTickerCount and histogramData const
+* Add DB property rocksdb.estimate-num-keys, estimated number of live keys in DB.
+* Add DB::GetIntProperty(), which returns DB properties that are integer as uint64_t.
+* The Prefix Extractor used with V2 compaction filters is now passed user key to SliceTransform::Transform instead of unparsed RocksDB key.
+
+## 3.3.0 (7/10/2014)
+### New Features
+* Added JSON API prototype.
+* HashLinklist reduces performance outlier caused by skewed bucket by switching data in the bucket from linked list to skip list. Add parameter threshold_use_skiplist in NewHashLinkListRepFactory().
+* RocksDB is now able to reclaim storage space more effectively during the compaction process.  This is done by compensating the size of each deletion entry by the 2X average value size, which makes compaction to be triggerred by deletion entries more easily.
+* Add TimeOut API to write.  Now WriteOptions have a variable called timeout_hint_us.  With timeout_hint_us set to non-zero, any write associated with this timeout_hint_us may be aborted when it runs longer than the specified timeout_hint_us, and it is guaranteed that any write completes earlier than the specified time-out will not be aborted due to the time-out condition.
+* Add a rate_limiter option, which controls total throughput of flush and compaction. The throughput is specified in bytes/sec. Flush always has precedence over compaction when available bandwidth is constrained.
+
+### Public API changes
+* Removed NewTotalOrderPlainTableFactory because it is not used and implemented semantically incorrect.
+
+## 3.2.0 (06/20/2014)
+
+### Public API changes
+* We removed seek compaction as a concept from RocksDB because:
+1) It makes more sense for spinning disk workloads, while RocksDB is primarily designed for flash and memory,
+2) It added some complexity to the important code-paths,
+3) None of our internal customers were really using it.
+Because of that, Options::disable_seek_compaction is now obsolete. It is still a parameter in Options, so it does not break the build, but it does not have any effect. We plan to completely remove it at some point, so we ask users to please remove this option from your code base.
+* Add two paramters to NewHashLinkListRepFactory() for logging on too many entries in a hash bucket when flushing.
+* Added new option BlockBasedTableOptions::hash_index_allow_collision. When enabled, prefix hash index for block-based table will not store prefix and allow hash collision, reducing memory consumption.
+
+### New Features
+* PlainTable now supports a new key encoding: for keys of the same prefix, the prefix is only written once. It can be enabled through encoding_type paramter of NewPlainTableFactory()
+* Add AdaptiveTableFactory, which is used to convert from a DB of PlainTable to BlockBasedTabe, or vise versa. It can be created using NewAdaptiveTableFactory()
+
+### Performance Improvements
+* Tailing Iterator re-implemeted with ForwardIterator + Cascading Search Hint , see ~20% throughput improvement.
+
+## 3.1.0 (05/21/2014)
+
+### Public API changes
+* Replaced ColumnFamilyOptions::table_properties_collectors with ColumnFamilyOptions::table_properties_collector_factories
+
+### New Features
+* Hash index for block-based table will be materialized and reconstructed more efficiently. Previously hash index is constructed by scanning the whole table during every table open.
+* FIFO compaction style
+
+## 3.0.0 (05/05/2014)
+
+### Public API changes
+* Added _LEVEL to all InfoLogLevel enums
+* Deprecated ReadOptions.prefix and ReadOptions.prefix_seek. Seek() defaults to prefix-based seek when Options.prefix_extractor is supplied. More detail is documented in https://github.com/facebook/rocksdb/wiki/Prefix-Seek-API-Changes
+* MemTableRepFactory::CreateMemTableRep() takes info logger as an extra parameter.
+
+### New Features
+* Column family support
+* Added an option to use different checksum functions in BlockBasedTableOptions
+* Added ApplyToAllCacheEntries() function to Cache
+
+## 2.8.0 (04/04/2014)
+
+* Removed arena.h from public header files.
+* By default, checksums are verified on every read from database
+* Change default value of several options, including: paranoid_checks=true, max_open_files=5000, level0_slowdown_writes_trigger=20, level0_stop_writes_trigger=24, disable_seek_compaction=true, max_background_flushes=1 and allow_mmap_writes=false
+* Added is_manual_compaction to CompactionFilter::Context
+* Added "virtual void WaitForJoin()" in class Env. Default operation is no-op.
+* Removed BackupEngine::DeleteBackupsNewerThan() function
+* Added new option -- verify_checksums_in_compaction
+* Changed Options.prefix_extractor from raw pointer to shared_ptr (take ownership)
+  Changed HashSkipListRepFactory and HashLinkListRepFactory constructor to not take SliceTransform object (use Options.prefix_extractor implicitly)
+* Added Env::GetThreadPoolQueueLen(), which returns the waiting queue length of thread pools
+* Added a command "checkconsistency" in ldb tool, which checks
+  if file system state matches DB state (file existence and file sizes)
+* Separate options related to block based table to a new struct BlockBasedTableOptions.
+* WriteBatch has a new function Count() to return total size in the batch, and Data() now returns a reference instead of a copy
+* Add more counters to perf context.
+* Supports several more DB properties: compaction-pending, background-errors and cur-size-active-mem-table.
+
+### New Features
+* If we find one truncated record at the end of the MANIFEST or WAL files,
+  we will ignore it. We assume that writers of these records were interrupted
+  and that we can safely ignore it.
+* A new SST format "PlainTable" is added, which is optimized for memory-only workloads. It can be created through NewPlainTableFactory() or NewTotalOrderPlainTableFactory().
+* A new mem table implementation hash linked list optimizing for the case that there are only few keys for each prefix, which can be created through NewHashLinkListRepFactory().
+* Merge operator supports a new function PartialMergeMulti() to allow users to do partial merges against multiple operands.
+* Now compaction filter has a V2 interface. It buffers the kv-pairs sharing the same key prefix, process them in batches, and return the batched results back to DB. The new interface uses a new structure CompactionFilterContext for the same purpose as CompactionFilter::Context in V1.
+* Geo-spatial support for locations and radial-search.
+
 ## 2.7.0 (01/28/2014)
 
 ### Public API changes

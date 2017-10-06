@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#ifndef ROCKSDB_LITE
 #include "util/blob_store.h"
 
 namespace rocksdb {
@@ -131,7 +132,9 @@ BlobStore::~BlobStore() {
 
 Status BlobStore::Put(const Slice& value, Blob* blob) {
   // convert size to number of blocks
-  Status s = Allocate((value.size() + block_size_ - 1) / block_size_, blob);
+  Status s = Allocate(
+      static_cast<uint32_t>((value.size() + block_size_ - 1) / block_size_),
+      blob);
   if (!s.ok()) {
     return s;
   }
@@ -161,7 +164,7 @@ Status BlobStore::Put(const Slice& value, Blob* blob) {
 
   if (size_left > 0) {
     Delete(*blob);
-    return Status::IOError("Tried to write more data than fits in the blob");
+    return Status::Corruption("Tried to write more data than fits in the blob");
   }
 
   return Status::OK();
@@ -187,9 +190,13 @@ Status BlobStore::Get(const Blob& blob,
                                               chunk.size * block_size_,
                                               &result,
                                               &value->at(offset));
-    if (!s.ok() || result.size() < chunk.size * block_size_) {
+    if (!s.ok()) {
       value->clear();
-      return Status::IOError("Could not read in from file");
+      return s;
+    }
+    if (result.size() < chunk.size * block_size_) {
+      value->clear();
+      return Status::Corruption("Could not read in from file");
     }
     offset += chunk.size * block_size_;
   }
@@ -236,7 +243,7 @@ Status BlobStore::CreateNewBucket() {
   MutexLock l(&buckets_mutex_);
 
   if (buckets_size_ >= max_buckets_) {
-    return Status::IOError("Max size exceeded\n");
+    return Status::NotSupported("Max size exceeded\n");
   }
 
   int new_bucket_id = buckets_size_;
@@ -262,3 +269,4 @@ Status BlobStore::CreateNewBucket() {
 }
 
 } // namespace rocksdb
+#endif  // ROCKSDB_LITE

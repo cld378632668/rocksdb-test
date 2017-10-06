@@ -3,6 +3,7 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 
+#include "rocksdb/options.h"
 #include "rocksdb/flush_block_policy.h"
 #include "rocksdb/slice.h"
 #include "table/block_builder.h"
@@ -61,10 +62,11 @@ class FlushBlockBySizePolicy : public FlushBlockPolicy {
 };
 
 FlushBlockPolicy* FlushBlockBySizePolicyFactory::NewFlushBlockPolicy(
+    const BlockBasedTableOptions& table_options,
     const BlockBuilder& data_block_builder) const {
-  return new FlushBlockBySizePolicy(block_size_,
-                                    block_size_deviation_,
-                                    data_block_builder);
+  return new FlushBlockBySizePolicy(
+      table_options.block_size, table_options.block_size_deviation,
+      data_block_builder);
 }
 
 }  // namespace rocksdb

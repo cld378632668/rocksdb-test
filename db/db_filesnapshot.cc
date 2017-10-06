@@ -7,6 +7,13 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#ifndef ROCKSDB_LITE
+
+#ifndef __STDC_FORMAT_MACROS
+#define __STDC_FORMAT_MACROS
+#endif
+
+#include <inttypes.h>
 #include <algorithm>
 #include <string>
 #include <stdint.h>
@@ -17,6 +24,7 @@
 #include "rocksdb/env.h"
 #include "port/port.h"
 #include "util/mutexlock.h"
+#include "util/sync_point.h"
 
 namespace rocksdb {
 
@@ -24,14 +32,18 @@ Status DBImpl::DisableFileDeletions() {
   MutexLock l(&mutex_);
   ++disable_delete_obsolete_files_;
   if (disable_delete_obsolete_files_ == 1) {
-    // if not, it has already been disabled, so don't log anything
-    Log(options_.info_log, "File Deletions Disabled");
+    Log(InfoLogLevel::INFO_LEVEL, db_options_.info_log,
+        "File Deletions Disabled");
+  } else {
+    Log(InfoLogLevel::WARN_LEVEL, db_options_.info_log,
+        "File Deletions Disabled, but already disabled. Counter: %d",
+        disable_delete_obsolete_files_);
   }
   return Status::OK();
 }
 
 Status DBImpl::EnableFileDeletions(bool force) {
-  DeletionState deletion_state;
+  JobContext job_context;
   bool should_purge_files = false;
   {
     MutexLock l(&mutex_);
@@ -42,16 +54,25 @@ Status DBImpl::EnableFileDeletions(bool force) {
       --disable_delete_obsolete_files_;
     }
     if (disable_delete_obsolete_files_ == 0)  {
-      Log(options_.info_log, "File Deletions Enabled");
+      Log(InfoLogLevel::INFO_LEVEL, db_options_.info_log,
+          "File Deletions Enabled");
       should_purge_files = true;
-      FindObsoleteFiles(deletion_state, true);
+      FindObsoleteFiles(&job_context, true);
+    } else {
+      Log(InfoLogLevel::WARN_LEVEL, db_options_.info_log,
+          "File Deletions Enable, but not really enabled. Counter: %d",
+          disable_delete_obsolete_files_);
     }
   }
   if (should_purge_files)  {
-    PurgeObsoleteFiles(deletion_state);
+    PurgeObsoleteFiles(job_context);
   }
-  LogFlush(options_.info_log);
+  LogFlush(db_options_.info_log);
   return Status::OK();
+}
+
+int DBImpl::IsFileDeletionsEnabled() const {
+  return disable_delete_obsolete_files_;
 }
 
 Status DBImpl::GetLiveFiles(std::vector<std::string>& ret,
@@ -60,21 +81,36 @@ Status DBImpl::GetLiveFiles(std::vector<std::string>& ret,
 
   *manifest_file_size = 0;
 
+  mutex_.Lock();
+
   if (flush_memtable) {
     // flush all dirty data to disk.
-    Status status =  Flush(FlushOptions());
+    Status status;
+    for (auto cfd : *versions_->GetColumnFamilySet()) {
+      cfd->Ref();
+      mutex_.Unlock();
+      status = FlushMemTable(cfd, FlushOptions());
+      mutex_.Lock();
+      cfd->Unref();
+      if (!status.ok()) {
+        break;
+      }
+    }
+    versions_->GetColumnFamilySet()->FreeDeadColumnFamilies();
+
     if (!status.ok()) {
-      Log(options_.info_log, "Cannot Flush data %s\n",
-          status.ToString().c_str());
+      mutex_.Unlock();
+      Log(InfoLogLevel::ERROR_LEVEL, db_options_.info_log,
+          "Cannot Flush data %s\n", status.ToString().c_str());
       return status;
     }
   }
 
-  MutexLock l(&mutex_);
-
   // Make a set of all of the live *.sst files
-  std::set<uint64_t> live;
-  versions_->current()->AddLiveFiles(&live);
+  std::vector<FileDescriptor> live;
+  for (auto cfd : *versions_->GetColumnFamilySet()) {
+    cfd->current()->AddLiveFiles(&live);
+  }
 
   ret.clear();
   ret.reserve(live.size() + 2); //*.sst + CURRENT + MANIFEST
@@ -82,33 +118,22 @@ Status DBImpl::GetLiveFiles(std::vector<std::string>& ret,
   // create names of the live files. The names are not absolute
   // paths, instead they are relative to dbname_;
   for (auto live_file : live) {
-    ret.push_back(TableFileName("", live_file));
+    ret.push_back(MakeTableFileName("", live_file.GetNumber()));
   }
 
   ret.push_back(CurrentFileName(""));
-  ret.push_back(DescriptorFileName("", versions_->ManifestFileNumber()));
+  ret.push_back(DescriptorFileName("", versions_->manifest_file_number()));
 
   // find length of manifest file while holding the mutex lock
-  *manifest_file_size = versions_->ManifestFileSize();
+  *manifest_file_size = versions_->manifest_file_size();
 
+  mutex_.Unlock();
   return Status::OK();
 }
 
 Status DBImpl::GetSortedWalFiles(VectorLogPtr& files) {
-  // First get sorted files in archive dir, then append sorted files from main
-  // dir to maintain sorted order
-
-  // list wal files in archive dir.
-  Status s;
-  std::string archivedir = ArchivalDirectory(options_.wal_dir);
-  if (env_->FileExists(archivedir)) {
-    s = AppendSortedWalsOfType(archivedir, files, kArchivedLogFile);
-    if (!s.ok()) {
-      return s;
-    }
-  }
-  // list wal files in main db dir.
-  return AppendSortedWalsOfType(options_.wal_dir, files, kAliveLogFile);
+  return wal_manager_.GetSortedWalFiles(files);
+}
 }
 
-}
+#endif  // ROCKSDB_LITE

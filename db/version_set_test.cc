@@ -14,14 +14,15 @@
 
 namespace rocksdb {
 
-class FindFileTest {
+class GenerateLevelFilesBriefTest {
  public:
   std::vector<FileMetaData*> files_;
-  bool disjoint_sorted_files_;
+  LevelFilesBrief file_level_;
+  Arena arena_;
 
-  FindFileTest() : disjoint_sorted_files_(true) { }
+  GenerateLevelFilesBriefTest() { }
 
-  ~FindFileTest() {
+  ~GenerateLevelFilesBriefTest() {
     for (unsigned int i = 0; i < files_.size(); i++) {
       delete files_[i];
     }
@@ -31,29 +32,108 @@ class FindFileTest {
            SequenceNumber smallest_seq = 100,
            SequenceNumber largest_seq = 100) {
     FileMetaData* f = new FileMetaData;
-    f->number = files_.size() + 1;
+    f->fd = FileDescriptor(files_.size() + 1, 0, 0);
     f->smallest = InternalKey(smallest, smallest_seq, kTypeValue);
     f->largest = InternalKey(largest, largest_seq, kTypeValue);
     files_.push_back(f);
   }
 
+  int Compare() {
+    int diff = 0;
+    for (size_t i = 0; i < files_.size(); i++) {
+      if (file_level_.files[i].fd.GetNumber() != files_[i]->fd.GetNumber()) {
+        diff++;
+      }
+    }
+    return diff;
+  }
+};
+
+TEST(GenerateLevelFilesBriefTest, Empty) {
+  DoGenerateLevelFilesBrief(&file_level_, files_, &arena_);
+  ASSERT_EQ(0u, file_level_.num_files);
+  ASSERT_EQ(0, Compare());
+}
+
+TEST(GenerateLevelFilesBriefTest, Single) {
+  Add("p", "q");
+  DoGenerateLevelFilesBrief(&file_level_, files_, &arena_);
+  ASSERT_EQ(1u, file_level_.num_files);
+  ASSERT_EQ(0, Compare());
+}
+
+
+TEST(GenerateLevelFilesBriefTest, Multiple) {
+  Add("150", "200");
+  Add("200", "250");
+  Add("300", "350");
+  Add("400", "450");
+  DoGenerateLevelFilesBrief(&file_level_, files_, &arena_);
+  ASSERT_EQ(4u, file_level_.num_files);
+  ASSERT_EQ(0, Compare());
+}
+
+class FindLevelFileTest {
+ public:
+  LevelFilesBrief file_level_;
+  bool disjoint_sorted_files_;
+  Arena arena_;
+
+  FindLevelFileTest() : disjoint_sorted_files_(true) { }
+
+  ~FindLevelFileTest() {
+  }
+
+  void LevelFileInit(size_t num = 0) {
+    char* mem = arena_.AllocateAligned(num * sizeof(FdWithKeyRange));
+    file_level_.files = new (mem)FdWithKeyRange[num];
+    file_level_.num_files = 0;
+  }
+
+  void Add(const char* smallest, const char* largest,
+           SequenceNumber smallest_seq = 100,
+           SequenceNumber largest_seq = 100) {
+    InternalKey smallest_key = InternalKey(smallest, smallest_seq, kTypeValue);
+    InternalKey largest_key = InternalKey(largest, largest_seq, kTypeValue);
+
+    Slice smallest_slice = smallest_key.Encode();
+    Slice largest_slice = largest_key.Encode();
+
+    char* mem = arena_.AllocateAligned(
+        smallest_slice.size() + largest_slice.size());
+    memcpy(mem, smallest_slice.data(), smallest_slice.size());
+    memcpy(mem + smallest_slice.size(), largest_slice.data(),
+        largest_slice.size());
+
+    // add to file_level_
+    size_t num = file_level_.num_files;
+    auto& file = file_level_.files[num];
+    file.fd = FileDescriptor(num + 1, 0, 0);
+    file.smallest_key = Slice(mem, smallest_slice.size());
+    file.largest_key = Slice(mem + smallest_slice.size(),
+        largest_slice.size());
+    file_level_.num_files++;
+  }
+
   int Find(const char* key) {
     InternalKey target(key, 100, kTypeValue);
     InternalKeyComparator cmp(BytewiseComparator());
-    return FindFile(cmp, files_, target.Encode());
+    return FindFile(cmp, file_level_, target.Encode());
   }
 
   bool Overlaps(const char* smallest, const char* largest) {
     InternalKeyComparator cmp(BytewiseComparator());
     Slice s(smallest != nullptr ? smallest : "");
     Slice l(largest != nullptr ? largest : "");
-    return SomeFileOverlapsRange(cmp, disjoint_sorted_files_, files_,
+    return SomeFileOverlapsRange(cmp, disjoint_sorted_files_, file_level_,
                                  (smallest != nullptr ? &s : nullptr),
                                  (largest != nullptr ? &l : nullptr));
   }
 };
 
-TEST(FindFileTest, Empty) {
+TEST(FindLevelFileTest, LevelEmpty) {
+  LevelFileInit(0);
+
   ASSERT_EQ(0, Find("foo"));
   ASSERT_TRUE(! Overlaps("a", "z"));
   ASSERT_TRUE(! Overlaps(nullptr, "z"));
@@ -61,7 +141,9 @@ TEST(FindFileTest, Empty) {
   ASSERT_TRUE(! Overlaps(nullptr, nullptr));
 }
 
-TEST(FindFileTest, Single) {
+TEST(FindLevelFileTest, LevelSingle) {
+  LevelFileInit(1);
+
   Add("p", "q");
   ASSERT_EQ(0, Find("a"));
   ASSERT_EQ(0, Find("p"));
@@ -91,8 +173,9 @@ TEST(FindFileTest, Single) {
   ASSERT_TRUE(Overlaps(nullptr, nullptr));
 }
 
+TEST(FindLevelFileTest, LevelMultiple) {
+  LevelFileInit(4);
 
-TEST(FindFileTest, Multiple) {
   Add("150", "200");
   Add("200", "250");
   Add("300", "350");
@@ -130,7 +213,9 @@ TEST(FindFileTest, Multiple) {
   ASSERT_TRUE(Overlaps("450", "500"));
 }
 
-TEST(FindFileTest, MultipleNullBoundaries) {
+TEST(FindLevelFileTest, LevelMultipleNullBoundaries) {
+  LevelFileInit(4);
+
   Add("150", "200");
   Add("200", "250");
   Add("300", "350");
@@ -150,7 +235,9 @@ TEST(FindFileTest, MultipleNullBoundaries) {
   ASSERT_TRUE(Overlaps("450", nullptr));
 }
 
-TEST(FindFileTest, OverlapSequenceChecks) {
+TEST(FindLevelFileTest, LevelOverlapSequenceChecks) {
+  LevelFileInit(1);
+
   Add("200", "200", 5000, 3000);
   ASSERT_TRUE(! Overlaps("199", "199"));
   ASSERT_TRUE(! Overlaps("201", "300"));
@@ -159,7 +246,9 @@ TEST(FindFileTest, OverlapSequenceChecks) {
   ASSERT_TRUE(Overlaps("200", "210"));
 }
 
-TEST(FindFileTest, OverlappingFiles) {
+TEST(FindLevelFileTest, LevelOverlappingFiles) {
+  LevelFileInit(2);
+
   Add("150", "600");
   Add("400", "500");
   disjoint_sorted_files_ = false;

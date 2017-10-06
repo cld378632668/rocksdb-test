@@ -3,9 +3,20 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-#include "util/stack_trace.h"
+#include "port/stack_trace.h"
 
-#ifdef OS_LINUX
+#if defined(ROCKSDB_LITE) || !(defined(OS_LINUX) || defined(OS_MACOSX))
+
+// noop
+
+namespace rocksdb {
+namespace port {
+void InstallStackTraceHandler() {}
+void PrintStack(int first_frames_to_skip) {}
+}  // namespace port
+}  // namespace rocksdb
+
+#else
 
 #include <execinfo.h>
 #include <signal.h>
@@ -13,16 +24,20 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <cxxabi.h>
 
 namespace rocksdb {
+namespace port {
 
-static const char* GetExecutableName()
-{
+namespace {
+
+#ifdef OS_LINUX
+const char* GetExecutableName() {
   static char name[1024];
 
   char link[1024];
   snprintf(link, sizeof(link), "/proc/%d/exe", getpid());
-  auto read = readlink(link, name, sizeof(name));
+  auto read = readlink(link, name, sizeof(name) - 1);
   if (-1 == read) {
     return nullptr;
   } else {
@@ -31,38 +46,68 @@ static const char* GetExecutableName()
   }
 }
 
+void PrintStackTraceLine(const char* symbol, void* frame) {
+  static const char* executable = GetExecutableName();
+  if (symbol) {
+    fprintf(stderr, "%s ", symbol);
+  }
+  if (executable) {
+    // out source to addr2line, for the address translation
+    const int kLineMax = 256;
+    char cmd[kLineMax];
+    snprintf(cmd, kLineMax, "addr2line %p -e %s -f -C 2>&1", frame, executable);
+    auto f = popen(cmd, "r");
+    if (f) {
+      char line[kLineMax];
+      while (fgets(line, sizeof(line), f)) {
+        line[strlen(line) - 1] = 0;  // remove newline
+        fprintf(stderr, "%s\t", line);
+      }
+      pclose(f);
+    }
+  } else {
+    fprintf(stderr, " %p", frame);
+  }
+
+  fprintf(stderr, "\n");
+}
+#elif OS_MACOSX
+
+void PrintStackTraceLine(const char* symbol, void* frame) {
+  static int pid = getpid();
+  // out source to atos, for the address translation
+  const int kLineMax = 256;
+  char cmd[kLineMax];
+  snprintf(cmd, kLineMax, "xcrun atos -d %p -p %d  2>&1", frame, pid);
+  auto f = popen(cmd, "r");
+  if (f) {
+    char line[kLineMax];
+    while (fgets(line, sizeof(line), f)) {
+      line[strlen(line) - 1] = 0;  // remove newline
+      fprintf(stderr, "%s\t", line);
+    }
+    pclose(f);
+  } else if (symbol) {
+    fprintf(stderr, "%s ", symbol);
+  }
+
+  fprintf(stderr, "\n");
+}
+
+#endif
+
+}  // namespace
+
 void PrintStack(int first_frames_to_skip) {
   const int kMaxFrames = 100;
-  void *frames[kMaxFrames];
+  void* frames[kMaxFrames];
 
   auto num_frames = backtrace(frames, kMaxFrames);
   auto symbols = backtrace_symbols(frames, num_frames);
 
-  auto executable = GetExecutableName();
-
   for (int i = first_frames_to_skip; i < num_frames; ++i) {
     fprintf(stderr, "#%-2d  ", i - first_frames_to_skip);
-    if (symbols) {
-      fprintf(stderr, "%s ", symbols[i]);
-    }
-    if (executable) {
-      // out source to addr2line, for the address translation
-      const int kLineMax = 256;
-      char cmd[kLineMax];
-      sprintf(cmd, "addr2line %p -e %s -f -C 2>&1", frames[i], executable);
-      auto f = popen(cmd, "r");
-      if (f) {
-        char line[kLineMax];
-        while (fgets(line, sizeof(line), f)) {
-          line[strlen(line) - 1] = 0; // remove newline
-          fprintf(stderr, "%s\t", line);
-        }
-        pclose(f);
-      }
-    } else {
-      fprintf(stderr, " %p", frames[i]);
-    }
-    fprintf(stderr, "\n");
+    PrintStackTraceLine((symbols != nullptr) ? symbols[i] : nullptr, frames[i]);
   }
 }
 
@@ -83,20 +128,9 @@ void InstallStackTraceHandler() {
   signal(SIGSEGV, StackTraceHandler);
   signal(SIGBUS, StackTraceHandler);
   signal(SIGABRT, StackTraceHandler);
-
-  printf("Installed stack trace handler for SIGILL SIGSEGV SIGBUS SIGABRT\n");
-
 }
 
-}   // namespace rocksdb
+}  // namespace port
+}  // namespace rocksdb
 
-#else // no-op for non-linux system for now
-
-namespace rocksdb {
-
-void InstallStackTraceHandler() {}
-void PrintStack(int first_frames_to_skip) {}
-
-}
-
-#endif // OS_LINUX
+#endif

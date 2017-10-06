@@ -6,16 +6,16 @@
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
+#include "db/dbformat.h"
 
 #include <stdio.h>
-#include "db/dbformat.h"
 #include "port/port.h"
 #include "util/coding.h"
 #include "util/perf_context_imp.h"
 
 namespace rocksdb {
 
-static uint64_t PackSequenceAndType(uint64_t seq, ValueType t) {
+uint64_t PackSequenceAndType(uint64_t seq, ValueType t) {
   assert(seq <= kMaxSequenceNumber);
   assert(t <= kValueTypeForSeek);
   return (seq << 8) | t;
@@ -59,13 +59,35 @@ int InternalKeyComparator::Compare(const Slice& akey, const Slice& bkey) const {
   //    decreasing sequence number
   //    decreasing type (though sequence# should be enough to disambiguate)
   int r = user_comparator_->Compare(ExtractUserKey(akey), ExtractUserKey(bkey));
-  BumpPerfCount(&perf_context.user_key_comparison_count);
+  PERF_COUNTER_ADD(user_key_comparison_count, 1);
   if (r == 0) {
     const uint64_t anum = DecodeFixed64(akey.data() + akey.size() - 8);
     const uint64_t bnum = DecodeFixed64(bkey.data() + bkey.size() - 8);
     if (anum > bnum) {
       r = -1;
     } else if (anum < bnum) {
+      r = +1;
+    }
+  }
+  return r;
+}
+
+int InternalKeyComparator::Compare(const ParsedInternalKey& a,
+                                   const ParsedInternalKey& b) const {
+  // Order by:
+  //    increasing user key (according to user-supplied comparator)
+  //    decreasing sequence number
+  //    decreasing type (though sequence# should be enough to disambiguate)
+  int r = user_comparator_->Compare(a.user_key, b.user_key);
+  PERF_COUNTER_ADD(user_key_comparison_count, 1);
+  if (r == 0) {
+    if (a.sequence > b.sequence) {
+      r = -1;
+    } else if (a.sequence < b.sequence) {
+      r = +1;
+    } else if (a.type > b.type) {
+      r = -1;
+    } else if (a.type < b.type) {
       r = +1;
     }
   }
@@ -105,28 +127,8 @@ void InternalKeyComparator::FindShortSuccessor(std::string* key) const {
   }
 }
 
-const char* InternalFilterPolicy::Name() const {
-  return user_policy_->Name();
-}
-
-void InternalFilterPolicy::CreateFilter(const Slice* keys, int n,
-                                        std::string* dst) const {
-  // We rely on the fact that the code in table.cc does not mind us
-  // adjusting keys[].
-  Slice* mkey = const_cast<Slice*>(keys);
-  for (int i = 0; i < n; i++) {
-    mkey[i] = ExtractUserKey(keys[i]);
-    // TODO(sanjay): Suppress dups?
-  }
-  user_policy_->CreateFilter(keys, n, dst);
-}
-
-bool InternalFilterPolicy::KeyMayMatch(const Slice& key, const Slice& f) const {
-  return user_policy_->KeyMayMatch(ExtractUserKey(key), f);
-}
-
-LookupKey::LookupKey(const Slice& user_key, SequenceNumber s) {
-  size_t usize = user_key.size();
+LookupKey::LookupKey(const Slice& _user_key, SequenceNumber s) {
+  size_t usize = _user_key.size();
   size_t needed = usize + 13;  // A conservative estimate
   char* dst;
   if (needed <= sizeof(space_)) {
@@ -135,9 +137,10 @@ LookupKey::LookupKey(const Slice& user_key, SequenceNumber s) {
     dst = new char[needed];
   }
   start_ = dst;
-  dst = EncodeVarint32(dst, usize + 8);
+  // NOTE: We don't support users keys of more than 2GB :)
+  dst = EncodeVarint32(dst, static_cast<uint32_t>(usize + 8));
   kstart_ = dst;
-  memcpy(dst, user_key.data(), usize);
+  memcpy(dst, _user_key.data(), usize);
   dst += usize;
   EncodeFixed64(dst, PackSequenceAndType(s, kValueTypeForSeek));
   dst += 8;

@@ -3,20 +3,35 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 
+#ifndef GFLAGS
+#include <cstdio>
+int main() {
+  fprintf(stderr, "Please install gflags to run rocksdb tools\n");
+  return 1;
+}
+#else
+
 #include <gflags/gflags.h>
 
 #include "rocksdb/db.h"
-#include "rocksdb/table.h"
 #include "rocksdb/slice_transform.h"
+#include "rocksdb/table.h"
 #include "db/db_impl.h"
 #include "db/dbformat.h"
-#include "port/atomic_pointer.h"
 #include "table/block_based_table_factory.h"
+#include "table/plain_table_factory.h"
+#include "table/table_builder.h"
+#include "table/get_context.h"
 #include "util/histogram.h"
 #include "util/testharness.h"
 #include "util/testutil.h"
 
+using GFLAGS::ParseCommandLineFlags;
+using GFLAGS::SetUsageMessage;
+
 namespace rocksdb {
+
+namespace {
 // Make a key that i determines the first 4 characters and j determines the
 // last 4 characters.
 static std::string MakeKey(int i, int j, bool through_db) {
@@ -33,10 +48,10 @@ static std::string MakeKey(int i, int j, bool through_db) {
   return key.Encode().ToString();
 }
 
-static bool DummySaveValue(void* arg, const Slice& ikey, const Slice& v,
-                           bool didIO) {
-  return false;
+uint64_t Now(Env* env, bool measured_by_nanosecond) {
+  return measured_by_nanosecond ? env->NowNanos() : env->NowMicros();
 }
+}  // namespace
 
 // A very simple benchmark that.
 // Create a table with roughly numKey1 * numKey2 keys,
@@ -51,27 +66,29 @@ static bool DummySaveValue(void* arg, const Slice& ikey, const Slice& v,
 //
 // If for_terator=true, instead of just query one key each time, it queries
 // a range sharing the same prefix.
+namespace {
 void TableReaderBenchmark(Options& opts, EnvOptions& env_options,
                           ReadOptions& read_options, int num_keys1,
                           int num_keys2, int num_iter, int prefix_len,
                           bool if_query_empty_keys, bool for_iterator,
-                          bool through_db) {
-  Slice prefix = Slice();
+                          bool through_db, bool measured_by_nanosecond) {
+  rocksdb::InternalKeyComparator ikc(opts.comparator);
 
   std::string file_name = test::TmpDir()
       + "/rocksdb_table_reader_benchmark";
   std::string dbname = test::TmpDir() + "/rocksdb_table_reader_bench_db";
-  ReadOptions ro;
   WriteOptions wo;
   unique_ptr<WritableFile> file;
   Env* env = Env::Default();
   TableBuilder* tb = nullptr;
   DB* db = nullptr;
   Status s;
+  const ImmutableCFOptions ioptions(opts);
   if (!through_db) {
     env->NewWritableFile(file_name, &file, env_options);
-    tb = opts.table_factory->GetTableBuilder(opts, file.get(),
-                                             CompressionType::kNoCompression);
+    tb = opts.table_factory->NewTableBuilder(ioptions, ikc, file.get(),
+                                             CompressionType::kNoCompression,
+                                             CompressionOptions());
   } else {
     s = DB::Open(opts, dbname, &db);
     ASSERT_OK(s);
@@ -98,18 +115,17 @@ void TableReaderBenchmark(Options& opts, EnvOptions& env_options,
   unique_ptr<TableReader> table_reader;
   unique_ptr<RandomAccessFile> raf;
   if (!through_db) {
-    Status s = env->NewRandomAccessFile(file_name, &raf, env_options);
+    s = env->NewRandomAccessFile(file_name, &raf, env_options);
     uint64_t file_size;
     env->GetFileSize(file_name, &file_size);
-    s = opts.table_factory->GetTableReader(opts, env_options, std::move(raf),
-                                           file_size, &table_reader);
+    s = opts.table_factory->NewTableReader(
+        ioptions, env_options, ikc, std::move(raf), file_size, &table_reader);
   }
 
   Random rnd(301);
   std::string result;
   HistogramImpl hist;
 
-  void* arg = nullptr;
   for (int it = 0; it < num_iter; it++) {
     for (int i = 0; i < num_keys1; i++) {
       for (int j = 0; j < num_keys2; j++) {
@@ -123,15 +139,19 @@ void TableReaderBenchmark(Options& opts, EnvOptions& env_options,
         if (!for_iterator) {
           // Query one existing key;
           std::string key = MakeKey(r1, r2, through_db);
-          uint64_t start_micros = env->NowMicros();
-          port::MemoryBarrier();
+          uint64_t start_time = Now(env, measured_by_nanosecond);
           if (!through_db) {
-            s = table_reader->Get(ro, key, arg, DummySaveValue, nullptr);
+            std::string value;
+            MergeContext merge_context;
+            GetContext get_context(ioptions.comparator, ioptions.merge_operator,
+                                   ioptions.info_log, ioptions.statistics,
+                                   GetContext::kNotFound, Slice(key), &value,
+                                   nullptr, &merge_context);
+            s = table_reader->Get(read_options, key, &get_context);
           } else {
-            s = db->Get(ro, key, &result);
+            s = db->Get(read_options, key, &result);
           }
-          port::MemoryBarrier();
-          hist.Add(env->NowMicros() - start_micros);
+          hist.Add(Now(env, measured_by_nanosecond) - start_time);
         } else {
           int r2_len;
           if (if_query_empty_keys) {
@@ -144,13 +164,8 @@ void TableReaderBenchmark(Options& opts, EnvOptions& env_options,
           }
           std::string start_key = MakeKey(r1, r2, through_db);
           std::string end_key = MakeKey(r1, r2 + r2_len, through_db);
-          if (prefix_len < 16) {
-            prefix = Slice(start_key.data(), prefix_len);
-            read_options.prefix = &prefix;
-          }
           uint64_t total_time = 0;
-          uint64_t start_micros = env->NowMicros();
-          port::MemoryBarrier();
+          uint64_t start_time = Now(env, measured_by_nanosecond);
           Iterator* iter;
           if (!through_db) {
             iter = table_reader->NewIterator(read_options);
@@ -163,10 +178,9 @@ void TableReaderBenchmark(Options& opts, EnvOptions& env_options,
               break;
             }
             // verify key;
-            port::MemoryBarrier();
-            total_time += env->NowMicros() - start_micros;
+            total_time += Now(env, measured_by_nanosecond) - start_time;
             assert(Slice(MakeKey(r1, r2 + count, through_db)) == iter->key());
-            start_micros = env->NowMicros();
+            start_time = Now(env, measured_by_nanosecond);
             if (++count >= r2_len) {
               break;
             }
@@ -178,8 +192,7 @@ void TableReaderBenchmark(Options& opts, EnvOptions& env_options,
             assert(false);
           }
           delete iter;
-          port::MemoryBarrier();
-          total_time += env->NowMicros() - start_micros;
+          total_time += Now(env, measured_by_nanosecond) - start_time;
           hist.Add(total_time);
         }
       }
@@ -194,9 +207,10 @@ void TableReaderBenchmark(Options& opts, EnvOptions& env_options,
       "num_key2: %5d  %10s\n"
       "==================================================="
       "===================================================="
-      "\nHistogram (unit: microseconds): \n%s",
+      "\nHistogram (unit: %s): \n%s",
       opts.table_factory->Name(), num_keys1, num_keys2,
-      for_iterator? "iterator" : (if_query_empty_keys ? "empty" : "non_empty"),
+      for_iterator ? "iterator" : (if_query_empty_keys ? "empty" : "non_empty"),
+      measured_by_nanosecond ? "nanosecond" : "microsecond",
       hist.ToString().c_str());
   if (!through_db) {
     env->DeleteFile(file_name);
@@ -206,7 +220,8 @@ void TableReaderBenchmark(Options& opts, EnvOptions& env_options,
     DestroyDB(dbname, opts);
   }
 }
-} // namespace rocksdb
+}  // namespace
+}  // namespace rocksdb
 
 DEFINE_bool(query_empty, false, "query non-existing keys instead of existing "
             "ones.");
@@ -218,27 +233,77 @@ DEFINE_bool(iterator, false, "For test iterator");
 DEFINE_bool(through_db, false, "If enable, a DB instance will be created and "
             "the query will be against DB. Otherwise, will be directly against "
             "a table reader.");
+DEFINE_string(table_factory, "block_based",
+              "Table factory to use: `block_based` (default), `plain_table` or "
+              "`cuckoo_hash`.");
+DEFINE_string(time_unit, "microsecond",
+              "The time unit used for measuring performance. User can specify "
+              "`microsecond` (default) or `nanosecond`");
 
 int main(int argc, char** argv) {
-  google::SetUsageMessage(std::string("\nUSAGE:\n") + std::string(argv[0]) +
-                          " [OPTIONS]...");
-  google::ParseCommandLineFlags(&argc, &argv, true);
+  SetUsageMessage(std::string("\nUSAGE:\n") + std::string(argv[0]) +
+                  " [OPTIONS]...");
+  ParseCommandLineFlags(&argc, &argv, true);
 
-  rocksdb::TableFactory* tf = new rocksdb::BlockBasedTableFactory();
+  std::shared_ptr<rocksdb::TableFactory> tf;
   rocksdb::Options options;
   if (FLAGS_prefix_len < 16) {
-    options.prefix_extractor = rocksdb::NewFixedPrefixTransform(
-        FLAGS_prefix_len);
+    options.prefix_extractor.reset(rocksdb::NewFixedPrefixTransform(
+        FLAGS_prefix_len));
   }
-  options.SetUpDefaultFlushBlockPolicyFactory();
   rocksdb::ReadOptions ro;
   rocksdb::EnvOptions env_options;
   options.create_if_missing = true;
-  options.table_factory =
-      std::shared_ptr<rocksdb::TableFactory>(tf);
-  TableReaderBenchmark(options, env_options, ro, FLAGS_num_keys1,
-                       FLAGS_num_keys2, FLAGS_iter, FLAGS_prefix_len,
-                       FLAGS_query_empty, FLAGS_iterator, FLAGS_through_db);
-  delete tf;
+  options.compression = rocksdb::CompressionType::kNoCompression;
+
+  if (FLAGS_table_factory == "cuckoo_hash") {
+#ifndef ROCKSDB_LITE
+    options.allow_mmap_reads = true;
+    env_options.use_mmap_reads = true;
+    rocksdb::CuckooTableOptions table_options;
+    table_options.hash_table_ratio = 0.75;
+    tf.reset(rocksdb::NewCuckooTableFactory(table_options));
+#else
+    fprintf(stderr, "Plain table is not supported in lite mode\n");
+    exit(1);
+#endif  // ROCKSDB_LITE
+  } else if (FLAGS_table_factory == "plain_table") {
+#ifndef ROCKSDB_LITE
+    options.allow_mmap_reads = true;
+    env_options.use_mmap_reads = true;
+
+    rocksdb::PlainTableOptions plain_table_options;
+    plain_table_options.user_key_len = 16;
+    plain_table_options.bloom_bits_per_key = (FLAGS_prefix_len == 16) ? 0 : 8;
+    plain_table_options.hash_table_ratio = 0.75;
+
+    tf.reset(new rocksdb::PlainTableFactory(plain_table_options));
+    options.prefix_extractor.reset(rocksdb::NewFixedPrefixTransform(
+        FLAGS_prefix_len));
+#else
+    fprintf(stderr, "Cuckoo table is not supported in lite mode\n");
+    exit(1);
+#endif  // ROCKSDB_LITE
+  } else if (FLAGS_table_factory == "block_based") {
+    tf.reset(new rocksdb::BlockBasedTableFactory());
+  } else {
+    fprintf(stderr, "Invalid table type %s\n", FLAGS_table_factory.c_str());
+  }
+
+  if (tf) {
+    // if user provides invalid options, just fall back to microsecond.
+    bool measured_by_nanosecond = FLAGS_time_unit == "nanosecond";
+
+    options.table_factory = tf;
+    rocksdb::TableReaderBenchmark(options, env_options, ro, FLAGS_num_keys1,
+                                  FLAGS_num_keys2, FLAGS_iter, FLAGS_prefix_len,
+                                  FLAGS_query_empty, FLAGS_iterator,
+                                  FLAGS_through_db, measured_by_nanosecond);
+  } else {
+    return 1;
+  }
+
   return 0;
 }
+
+#endif  // GFLAGS

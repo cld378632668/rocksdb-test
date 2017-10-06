@@ -28,7 +28,9 @@ static int DecodeKey(const Slice& k) {
   return DecodeFixed32(k.data());
 }
 static void* EncodeValue(uintptr_t v) { return reinterpret_cast<void*>(v); }
-static int DecodeValue(void* v) { return reinterpret_cast<uintptr_t>(v); }
+static int DecodeValue(void* v) {
+  return static_cast<int>(reinterpret_cast<uintptr_t>(v));
+}
 
 class CacheTest {
  public:
@@ -106,6 +108,41 @@ class CacheTest {
   }
 };
 CacheTest* CacheTest::current_;
+
+namespace {
+void dumbDeleter(const Slice& key, void* value) { }
+}  // namespace
+
+TEST(CacheTest, UsageTest) {
+  // cache is shared_ptr and will be automatically cleaned up.
+  const uint64_t kCapacity = 100000;
+  auto cache = NewLRUCache(kCapacity, 8, 200);
+
+  size_t usage = 0;
+  const char* value = "abcdef";
+  // make sure everything will be cached
+  for (int i = 1; i < 100; ++i) {
+    std::string key(i, 'a');
+    auto kv_size = key.size() + 5;
+    cache->Release(
+        cache->Insert(key, (void*)value, kv_size, dumbDeleter)
+    );
+    usage += kv_size;
+    ASSERT_EQ(usage, cache->GetUsage());
+  }
+
+  // make sure the cache will be overloaded
+  for (uint64_t i = 1; i < kCapacity; ++i) {
+    auto key = std::to_string(i);
+    cache->Release(
+        cache->Insert(key, (void*)value, key.size() + 5, dumbDeleter)
+    );
+  }
+
+  // the usage should be close to the capacity
+  ASSERT_GT(kCapacity, cache->GetUsage());
+  ASSERT_LT(kCapacity * 0.95, cache->GetUsage());
+}
 
 TEST(CacheTest, HitAndMiss) {
   ASSERT_EQ(-1, Lookup(100));
@@ -349,10 +386,11 @@ class Value {
   ~Value() { std::cout << v_ << " is destructed\n"; }
 };
 
+namespace {
 void deleter(const Slice& key, void* value) {
-  delete (Value *)value;
+  delete static_cast<Value *>(value);
 }
-
+}  // namespace
 
 TEST(CacheTest, BadEviction) {
   int n = 10;
@@ -382,6 +420,28 @@ TEST(CacheTest, BadEviction) {
     cache->Release(handles[i]);
   }
   std::cout << "Poor entries\n";
+}
+
+namespace {
+std::vector<std::pair<int, int>> callback_state;
+void callback(void* entry, size_t charge) {
+  callback_state.push_back({DecodeValue(entry), static_cast<int>(charge)});
+}
+};
+
+TEST(CacheTest, ApplyToAllCacheEntiresTest) {
+  std::vector<std::pair<int, int>> inserted;
+  callback_state.clear();
+
+  for (int i = 0; i < 10; ++i) {
+    Insert(i, i * 2, i + 1);
+    inserted.push_back({i * 2, i + 1});
+  }
+  cache_->ApplyToAllCacheEntries(callback, true);
+
+  sort(inserted.begin(), inserted.end());
+  sort(callback_state.begin(), callback_state.end());
+  ASSERT_TRUE(inserted == callback_state);
 }
 
 }  // namespace rocksdb

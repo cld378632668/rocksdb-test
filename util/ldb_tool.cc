@@ -3,10 +3,22 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
+#ifndef ROCKSDB_LITE
 #include "rocksdb/ldb_tool.h"
 #include "util/ldb_cmd.h"
 
 namespace rocksdb {
+
+class DefaultSliceFormatter : public SliceFormatter {
+ public:
+  virtual std::string Format(const Slice& s) const override {
+    return s.ToString();
+  }
+};
+
+LDBOptions::LDBOptions()
+    : key_formatter(new DefaultSliceFormatter()) {
+}
 
 class LDBCommandRunner {
 public:
@@ -35,6 +47,7 @@ public:
         " with 'put','get','scan','dump','query','batchput'"
         " : DB supports ttl and value is internally timestamp-suffixed\n");
     ret.append("  --" + LDBCommand::ARG_BLOOM_BITS + "=<int,e.g.:14>\n");
+    ret.append("  --" + LDBCommand::ARG_FIX_PREFIX_LEN + "=<int,e.g.:14>\n");
     ret.append("  --" + LDBCommand::ARG_COMPRESSION_TYPE +
         "=<no|snappy|zlib|bzip2>\n");
     ret.append("  --" + LDBCommand::ARG_BLOCK_SIZE +
@@ -53,6 +66,7 @@ public:
     DeleteCommand::Help(ret);
     DBQuerierCommand::Help(ret);
     ApproxSizeCommand::Help(ret);
+    CheckConsistencyCommand::Help(ret);
 
     ret.append("\n\n");
     ret.append("Admin Commands:\n");
@@ -63,18 +77,21 @@ public:
     DBDumperCommand::Help(ret);
     DBLoaderCommand::Help(ret);
     ManifestDumpCommand::Help(ret);
+    ListColumnFamiliesCommand::Help(ret);
     InternalDumpCommand::Help(ret);
 
     fprintf(stderr, "%s\n", ret.c_str());
   }
 
-  static void RunCommand(int argc, char** argv, Options options) {
+  static void RunCommand(int argc, char** argv, Options options,
+                         const LDBOptions& ldb_options) {
     if (argc <= 2) {
       PrintHelp(argv[0]);
       exit(1);
     }
 
-    LDBCommand* cmdObj = LDBCommand::InitFromCmdLineArgs(argc, argv, options);
+    LDBCommand* cmdObj = LDBCommand::InitFromCmdLineArgs(argc, argv, options,
+                                                         ldb_options);
     if (cmdObj == nullptr) {
       fprintf(stderr, "Unknown command\n");
       PrintHelp(argv[0]);
@@ -96,8 +113,10 @@ public:
 };
 
 
-void LDBTool::Run(int argc, char** argv, Options options) {
-  LDBCommandRunner::RunCommand(argc, argv, options);
+void LDBTool::Run(int argc, char** argv, Options options,
+                  const LDBOptions& ldb_options) {
+  LDBCommandRunner::RunCommand(argc, argv, options, ldb_options);
 }
 } // namespace rocksdb
 
+#endif  // ROCKSDB_LITE

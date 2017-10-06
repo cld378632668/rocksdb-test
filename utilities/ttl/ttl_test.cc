@@ -4,7 +4,7 @@
 
 #include <memory>
 #include "rocksdb/compaction_filter.h"
-#include "utilities/utility_db.h"
+#include "rocksdb/utilities/db_ttl.h"
 #include "util/testharness.h"
 #include "util/logging.h"
 #include <map>
@@ -20,14 +20,31 @@ enum BatchOperation {
   PUT = 0,
   DELETE = 1
 };
-
 }
+
+class SpecialTimeEnv : public EnvWrapper {
+ public:
+  explicit SpecialTimeEnv(Env* base) : EnvWrapper(base) {
+    base->GetCurrentTime(&current_time_);
+  }
+
+  void Sleep(int64_t sleep_time) { current_time_ += sleep_time; }
+  virtual Status GetCurrentTime(int64_t* current_time) {
+    *current_time = current_time_;
+    return Status::OK();
+  }
+
+ private:
+  int64_t current_time_;
+};
 
 class TtlTest {
  public:
   TtlTest() {
+    env_.reset(new SpecialTimeEnv(Env::Default()));
     dbname_ = test::TmpDir() + "/db_ttl";
     options_.create_if_missing = true;
+    options_.env = env_.get();
     // ensure that compaction is kicked in to always strip timestamp from kvs
     options_.max_grandparent_overlap_factor = 0;
     // compaction should take place always from level0 for determinism
@@ -43,14 +60,15 @@ class TtlTest {
 
   // Open database with TTL support when TTL not provided with db_ttl_ pointer
   void OpenTtl() {
-    assert(db_ttl_ == nullptr); //  db should be closed before opening again
-    ASSERT_OK(UtilityDB::OpenTtlDB(options_, dbname_, &db_ttl_));
+    ASSERT_TRUE(db_ttl_ ==
+                nullptr);  //  db should be closed before opening again
+    ASSERT_OK(DBWithTTL::Open(options_, dbname_, &db_ttl_));
   }
 
   // Open database with TTL support when TTL provided with db_ttl_ pointer
   void OpenTtl(int32_t ttl) {
-    assert(db_ttl_ == nullptr);
-    ASSERT_OK(UtilityDB::OpenTtlDB(options_, dbname_, &db_ttl_, ttl));
+    ASSERT_TRUE(db_ttl_ == nullptr);
+    ASSERT_OK(DBWithTTL::Open(options_, dbname_, &db_ttl_, ttl));
   }
 
   // Open with TestFilter compaction filter
@@ -63,8 +81,8 @@ class TtlTest {
 
   // Open database with TTL support in read_only mode
   void OpenReadOnlyTtl(int32_t ttl) {
-    assert(db_ttl_ == nullptr);
-    ASSERT_OK(UtilityDB::OpenTtlDB(options_, dbname_, &db_ttl_, ttl, true));
+    ASSERT_TRUE(db_ttl_ == nullptr);
+    ASSERT_OK(DBWithTTL::Open(options_, dbname_, &db_ttl_, ttl, true));
   }
 
   void CloseTtl() {
@@ -76,7 +94,8 @@ class TtlTest {
   void MakeKVMap(int64_t num_entries) {
     kvmap_.clear();
     int digits = 1;
-    for (int dummy = num_entries; dummy /= 10 ; ++digits);
+    for (int64_t dummy = num_entries; dummy /= 10; ++digits) {
+    }
     int digits_in_i = 1;
     for (int64_t i = 0; i < num_entries; i++) {
       std::string key = "key";
@@ -92,17 +111,18 @@ class TtlTest {
       AppendNumberTo(&value, i);
       kvmap_[key] = value;
     }
-    ASSERT_EQ((int)kvmap_.size(), num_entries);//check all insertions done
+    ASSERT_EQ(static_cast<int64_t>(kvmap_.size()),
+              num_entries);  // check all insertions done
   }
 
   // Makes a write-batch with key-vals from kvmap_ and 'Write''s it
-  void MakePutWriteBatch(const BatchOperation* batch_ops, int num_ops) {
-    assert(num_ops <= (int)kvmap_.size());
+  void MakePutWriteBatch(const BatchOperation* batch_ops, int64_t num_ops) {
+    ASSERT_LE(num_ops, static_cast<int64_t>(kvmap_.size()));
     static WriteOptions wopts;
     static FlushOptions flush_opts;
     WriteBatch batch;
     kv_it_ = kvmap_.begin();
-    for (int i = 0; i < num_ops && kv_it_ != kvmap_.end(); i++, kv_it_++) {
+    for (int64_t i = 0; i < num_ops && kv_it_ != kvmap_.end(); i++, ++kv_it_) {
       switch (batch_ops[i]) {
         case PUT:
           batch.Put(kv_it_->first, kv_it_->second);
@@ -111,7 +131,7 @@ class TtlTest {
           batch.Delete(kv_it_->first);
           break;
         default:
-          assert(false);
+          ASSERT_TRUE(false);
       }
     }
     db_ttl_->Write(wopts, &batch);
@@ -119,26 +139,39 @@ class TtlTest {
   }
 
   // Puts num_entries starting from start_pos_map from kvmap_ into the database
-  void PutValues(int start_pos_map, int num_entries, bool flush = true) {
-    assert(db_ttl_);
-    ASSERT_LE(start_pos_map + num_entries, (int)kvmap_.size());
+  void PutValues(int64_t start_pos_map, int64_t num_entries, bool flush = true,
+                 ColumnFamilyHandle* cf = nullptr) {
+    ASSERT_TRUE(db_ttl_);
+    ASSERT_LE(start_pos_map + num_entries, static_cast<int64_t>(kvmap_.size()));
     static WriteOptions wopts;
     static FlushOptions flush_opts;
     kv_it_ = kvmap_.begin();
     advance(kv_it_, start_pos_map);
-    for (int i = 0; kv_it_ != kvmap_.end() && i < num_entries; i++, kv_it_++) {
-      ASSERT_OK(db_ttl_->Put(wopts, kv_it_->first, kv_it_->second));
+    for (int64_t i = 0; kv_it_ != kvmap_.end() && i < num_entries;
+         i++, ++kv_it_) {
+      ASSERT_OK(cf == nullptr
+                    ? db_ttl_->Put(wopts, kv_it_->first, kv_it_->second)
+                    : db_ttl_->Put(wopts, cf, kv_it_->first, kv_it_->second));
     }
     // Put a mock kv at the end because CompactionFilter doesn't delete last key
-    ASSERT_OK(db_ttl_->Put(wopts, "keymock", "valuemock"));
+    ASSERT_OK(cf == nullptr ? db_ttl_->Put(wopts, "keymock", "valuemock")
+                            : db_ttl_->Put(wopts, cf, "keymock", "valuemock"));
     if (flush) {
-      db_ttl_->Flush(flush_opts);
+      if (cf == nullptr) {
+        db_ttl_->Flush(flush_opts);
+      } else {
+        db_ttl_->Flush(flush_opts, cf);
+      }
     }
   }
 
   // Runs a manual compaction
-  void ManualCompact() {
-    db_ttl_->CompactRange(nullptr, nullptr);
+  void ManualCompact(ColumnFamilyHandle* cf = nullptr) {
+    if (cf == nullptr) {
+      db_ttl_->CompactRange(nullptr, nullptr);
+    } else {
+      db_ttl_->CompactRange(cf, nullptr, nullptr);
+    }
   }
 
   // checks the whole kvmap_ to return correct values using KeyMayExist
@@ -151,12 +184,12 @@ class TtlTest {
       if (ret == false || value_found == false) {
         fprintf(stderr, "KeyMayExist could not find key=%s in the database but"
                         " should have\n", kv.first.c_str());
-        assert(false);
+        ASSERT_TRUE(false);
       } else if (val.compare(kv.second) != 0) {
         fprintf(stderr, " value for key=%s present in database is %s but"
                         " should be %s\n", kv.first.c_str(), val.c_str(),
                         kv.second.c_str());
-        assert(false);
+        ASSERT_TRUE(false);
       }
     }
   }
@@ -166,17 +199,20 @@ class TtlTest {
   // Gets should return true if check is true and false otherwise
   // Also checks that value that we got is the same as inserted; and =kNewValue
   //   if test_compaction_change is true
-  void SleepCompactCheck(int slp_tim, int st_pos, int span, bool check = true,
-                         bool test_compaction_change = false) {
-    assert(db_ttl_);
-    sleep(slp_tim);
-    ManualCompact();
+  void SleepCompactCheck(int slp_tim, int64_t st_pos, int64_t span,
+                         bool check = true, bool test_compaction_change = false,
+                         ColumnFamilyHandle* cf = nullptr) {
+    ASSERT_TRUE(db_ttl_);
+
+    env_->Sleep(slp_tim);
+    ManualCompact(cf);
     static ReadOptions ropts;
     kv_it_ = kvmap_.begin();
     advance(kv_it_, st_pos);
     std::string v;
-    for (int i = 0; kv_it_ != kvmap_.end() && i < span; i++, kv_it_++) {
-      Status s = db_ttl_->Get(ropts, kv_it_->first, &v);
+    for (int64_t i = 0; kv_it_ != kvmap_.end() && i < span; i++, ++kv_it_) {
+      Status s = (cf == nullptr) ? db_ttl_->Get(ropts, kv_it_->first, &v)
+                                 : db_ttl_->Get(ropts, cf, kv_it_->first, &v);
       if (s.ok() != check) {
         fprintf(stderr, "key=%s ", kv_it_->first.c_str());
         if (!s.ok()) {
@@ -184,27 +220,28 @@ class TtlTest {
         } else {
           fprintf(stderr, "is present in db but was expected to be absent\n");
         }
-        assert(false);
+        ASSERT_TRUE(false);
       } else if (s.ok()) {
           if (test_compaction_change && v.compare(kNewValue_) != 0) {
             fprintf(stderr, " value for key=%s present in database is %s but "
                             " should be %s\n", kv_it_->first.c_str(), v.c_str(),
                             kNewValue_.c_str());
-            assert(false);
+            ASSERT_TRUE(false);
           } else if (!test_compaction_change && v.compare(kv_it_->second) !=0) {
             fprintf(stderr, " value for key=%s present in database is %s but "
                             " should be %s\n", kv_it_->first.c_str(), v.c_str(),
                             kv_it_->second.c_str());
-            assert(false);
+            ASSERT_TRUE(false);
           }
       }
     }
   }
 
   // Similar as SleepCompactCheck but uses TtlIterator to read from db
-  void SleepCompactCheckIter(int slp, int st_pos, int span, bool check=true) {
-    assert(db_ttl_);
-    sleep(slp);
+  void SleepCompactCheckIter(int slp, int st_pos, int64_t span,
+                             bool check = true) {
+    ASSERT_TRUE(db_ttl_);
+    env_->Sleep(slp);
     ManualCompact();
     static ReadOptions ropts;
     Iterator *dbiter = db_ttl_->NewIterator(ropts);
@@ -217,9 +254,8 @@ class TtlTest {
         ASSERT_NE(dbiter->value().compare(kv_it_->second), 0);
       }
     } else {  // dbiter should have found out kvmap_[st_pos]
-      for (int i = st_pos;
-           kv_it_ != kvmap_.end() && i < st_pos + span;
-           i++, kv_it_++)  {
+      for (int64_t i = st_pos; kv_it_ != kvmap_.end() && i < st_pos + span;
+           i++, ++kv_it_) {
         ASSERT_TRUE(dbiter->Valid());
         ASSERT_EQ(dbiter->value().compare(kv_it_->second), 0);
         dbiter->Next();
@@ -230,7 +266,7 @@ class TtlTest {
 
   class TestFilter : public CompactionFilter {
    public:
-    TestFilter(const int64_t kSampleSize, const std::string kNewValue)
+    TestFilter(const int64_t kSampleSize, const std::string& kNewValue)
       : kSampleSize_(kSampleSize),
         kNewValue_(kNewValue) {
     }
@@ -255,7 +291,7 @@ class TtlTest {
         return false; // Keep keys not matching the format "key<NUMBER>"
       }
 
-      int partition = kSampleSize_ / 3;
+      int64_t partition = kSampleSize_ / 3;
       if (num_key_end < partition) {
         return true;
       } else if (num_key_end < partition * 2) {
@@ -278,13 +314,12 @@ class TtlTest {
 
   class TestFilterFactory : public CompactionFilterFactory {
     public:
-      TestFilterFactory(const int64_t kSampleSize, const std::string kNewValue)
+      TestFilterFactory(const int64_t kSampleSize, const std::string& kNewValue)
         : kSampleSize_(kSampleSize),
           kNewValue_(kNewValue) {
       }
 
-      virtual std::unique_ptr<CompactionFilter>
-      CreateCompactionFilter(
+      virtual std::unique_ptr<CompactionFilter> CreateCompactionFilter(
           const CompactionFilter::Context& context) override {
         return std::unique_ptr<CompactionFilter>(
             new TestFilter(kSampleSize_, kNewValue_));
@@ -302,10 +337,11 @@ class TtlTest {
 
   // Choose carefully so that Put, Gets & Compaction complete in 1 second buffer
   const int64_t kSampleSize_ = 100;
+  std::string dbname_;
+  DBWithTTL* db_ttl_;
+  unique_ptr<SpecialTimeEnv> env_;
 
  private:
-  std::string dbname_;
-  StackableDB* db_ttl_;
   Options options_;
   KVMap kvmap_;
   KVMap::iterator kv_it_;
@@ -319,8 +355,8 @@ class TtlTest {
 // Partitions the sample-size provided into 3 sets over boundary1 and boundary2
 TEST(TtlTest, NoEffect) {
   MakeKVMap(kSampleSize_);
-  int boundary1 = kSampleSize_ / 3;
-  int boundary2 = 2 * boundary1;
+  int64_t boundary1 = kSampleSize_ / 3;
+  int64_t boundary2 = 2 * boundary1;
 
   OpenTtl();
   PutValues(0, boundary1);                       //T=0: Set1 never deleted
@@ -365,7 +401,7 @@ TEST(TtlTest, ResetTimestamp) {
 
   OpenTtl(3);
   PutValues(0, kSampleSize_);            // T=0: Insert Set1. Delete at t=3
-  sleep(2);                             // T=2
+  env_->Sleep(2);                        // T=2
   PutValues(0, kSampleSize_);            // T=2: Insert Set1. Delete at t=5
   SleepCompactCheck(2, 0, kSampleSize_); // T=4: Set1 should still be there
   CloseTtl();
@@ -477,9 +513,9 @@ TEST(TtlTest, CompactionFilter) {
 
   OpenTtlWithTestCompaction(3);
   PutValues(0, kSampleSize_);                   // T=0:Insert Set1.
-  int partition = kSampleSize_ / 3;
-  SleepCompactCheck(1, 0, partition, false);   // Part dropped
-  SleepCompactCheck(0, partition, partition);  // Part kept
+  int64_t partition = kSampleSize_ / 3;
+  SleepCompactCheck(1, 0, partition, false);                  // Part dropped
+  SleepCompactCheck(0, partition, partition);                 // Part kept
   SleepCompactCheck(0, 2 * partition, partition, true, true); // Part changed
   CloseTtl();
 }
@@ -495,6 +531,63 @@ TEST(TtlTest, KeyMayExist) {
   SimpleKeyMayExistCheck();
 
   CloseTtl();
+}
+
+TEST(TtlTest, ColumnFamiliesTest) {
+  DB* db;
+  Options options;
+  options.create_if_missing = true;
+  options.env = env_.get();
+
+  DB::Open(options, dbname_, &db);
+  ColumnFamilyHandle* handle;
+  ASSERT_OK(db->CreateColumnFamily(ColumnFamilyOptions(options),
+                                   "ttl_column_family", &handle));
+
+  delete handle;
+  delete db;
+
+  std::vector<ColumnFamilyDescriptor> column_families;
+  column_families.push_back(ColumnFamilyDescriptor(
+      kDefaultColumnFamilyName, ColumnFamilyOptions(options)));
+  column_families.push_back(ColumnFamilyDescriptor(
+      "ttl_column_family", ColumnFamilyOptions(options)));
+
+  std::vector<ColumnFamilyHandle*> handles;
+
+  ASSERT_OK(DBWithTTL::Open(DBOptions(options), dbname_, column_families,
+                            &handles, &db_ttl_, {3, 5}, false));
+  ASSERT_EQ(handles.size(), 2U);
+  ColumnFamilyHandle* new_handle;
+  ASSERT_OK(db_ttl_->CreateColumnFamilyWithTtl(options, "ttl_column_family_2",
+                                               &new_handle, 2));
+  handles.push_back(new_handle);
+
+  MakeKVMap(kSampleSize_);
+  PutValues(0, kSampleSize_, false, handles[0]);
+  PutValues(0, kSampleSize_, false, handles[1]);
+  PutValues(0, kSampleSize_, false, handles[2]);
+
+  // everything should be there after 1 second
+  SleepCompactCheck(1, 0, kSampleSize_, true, false, handles[0]);
+  SleepCompactCheck(0, 0, kSampleSize_, true, false, handles[1]);
+  SleepCompactCheck(0, 0, kSampleSize_, true, false, handles[2]);
+
+  // only column family 1 should be alive after 4 seconds
+  SleepCompactCheck(3, 0, kSampleSize_, false, false, handles[0]);
+  SleepCompactCheck(0, 0, kSampleSize_, true, false, handles[1]);
+  SleepCompactCheck(0, 0, kSampleSize_, false, false, handles[2]);
+
+  // nothing should be there after 6 seconds
+  SleepCompactCheck(2, 0, kSampleSize_, false, false, handles[0]);
+  SleepCompactCheck(0, 0, kSampleSize_, false, false, handles[1]);
+  SleepCompactCheck(0, 0, kSampleSize_, false, false, handles[2]);
+
+  for (auto h : handles) {
+    delete h;
+  }
+  delete db_ttl_;
+  db_ttl_ = nullptr;
 }
 
 } //  namespace rocksdb

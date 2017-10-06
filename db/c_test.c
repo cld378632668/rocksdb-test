@@ -75,6 +75,22 @@ static void CheckGet(
   Free(&val);
 }
 
+static void CheckGetCF(
+    rocksdb_t* db,
+    const rocksdb_readoptions_t* options,
+    rocksdb_column_family_handle_t* handle,
+    const char* key,
+    const char* expected) {
+  char* err = NULL;
+  size_t val_len;
+  char* val;
+  val = rocksdb_get_cf(db, options, handle, key, strlen(key), &val_len, &err);
+  CheckNoError(err);
+  CheckEqual(expected, val, val_len);
+  Free(&val);
+}
+
+
 static void CheckIter(rocksdb_iterator_t* iter,
                       const char* key, const char* val) {
   size_t len;
@@ -116,7 +132,7 @@ static void CmpDestroy(void* arg) { }
 
 static int CmpCompare(void* arg, const char* a, size_t alen,
                       const char* b, size_t blen) {
-  int n = (alen < blen) ? alen : blen;
+  size_t n = (alen < blen) ? alen : blen;
   int r = memcmp(a, b, n);
   if (r == 0) {
     if (alen < blen) r = -1;
@@ -145,7 +161,7 @@ static char* FilterCreate(
   memcpy(result, "fake", 4);
   return result;
 }
-unsigned char FilterKeyMatch(
+static unsigned char FilterKeyMatch(
     void* arg,
     const char* key, size_t length,
     const char* filter, size_t filter_length) {
@@ -154,12 +170,172 @@ unsigned char FilterKeyMatch(
   return fake_filter_result;
 }
 
+// Custom compaction filter
+static void CFilterDestroy(void* arg) {}
+static const char* CFilterName(void* arg) { return "foo"; }
+static unsigned char CFilterFilter(void* arg, int level, const char* key,
+                                   size_t key_length,
+                                   const char* existing_value,
+                                   size_t value_length, char** new_value,
+                                   size_t* new_value_length,
+                                   unsigned char* value_changed) {
+  if (key_length == 3) {
+    if (memcmp(key, "bar", key_length) == 0) {
+      return 1;
+    } else if (memcmp(key, "baz", key_length) == 0) {
+      *value_changed = 1;
+      *new_value = "newbazvalue";
+      *new_value_length = 11;
+      return 0;
+    }
+  }
+  return 0;
+}
+
+static void CFilterFactoryDestroy(void* arg) {}
+static const char* CFilterFactoryName(void* arg) { return "foo"; }
+static rocksdb_compactionfilter_t* CFilterCreate(
+    void* arg, rocksdb_compactionfiltercontext_t* context) {
+  return rocksdb_compactionfilter_create(NULL, CFilterDestroy, CFilterFilter,
+                                         CFilterName);
+}
+
+static rocksdb_t* CheckCompaction(rocksdb_t* db, rocksdb_options_t* options,
+                                  rocksdb_readoptions_t* roptions,
+                                  rocksdb_writeoptions_t* woptions) {
+  char* err = NULL;
+  db = rocksdb_open(options, dbname, &err);
+  CheckNoError(err);
+  rocksdb_put(db, woptions, "foo", 3, "foovalue", 8, &err);
+  CheckNoError(err);
+  CheckGet(db, roptions, "foo", "foovalue");
+  rocksdb_put(db, woptions, "bar", 3, "barvalue", 8, &err);
+  CheckNoError(err);
+  CheckGet(db, roptions, "bar", "barvalue");
+  rocksdb_put(db, woptions, "baz", 3, "bazvalue", 8, &err);
+  CheckNoError(err);
+  CheckGet(db, roptions, "baz", "bazvalue");
+
+  // Force compaction
+  rocksdb_compact_range(db, NULL, 0, NULL, 0);
+  // should have filtered bar, but not foo
+  CheckGet(db, roptions, "foo", "foovalue");
+  CheckGet(db, roptions, "bar", NULL);
+  CheckGet(db, roptions, "baz", "newbazvalue");
+  return db;
+}
+
+// Custom compaction filter V2.
+static void CompactionFilterV2Destroy(void* arg) { }
+static const char* CompactionFilterV2Name(void* arg) {
+  return "TestCompactionFilterV2";
+}
+static void CompactionFilterV2Filter(
+    void* arg, int level, size_t num_keys,
+    const char* const* keys_list, const size_t* keys_list_sizes,
+    const char* const* existing_values_list, const size_t* existing_values_list_sizes,
+    char** new_values_list, size_t* new_values_list_sizes,
+    unsigned char* to_delete_list) {
+  size_t i;
+  for (i = 0; i < num_keys; i++) {
+    // If any value is "gc", it's removed.
+    if (existing_values_list_sizes[i] == 2 && memcmp(existing_values_list[i], "gc", 2) == 0) {
+      to_delete_list[i] = 1;
+    } else if (existing_values_list_sizes[i] == 6 && memcmp(existing_values_list[i], "gc all", 6) == 0) {
+      // If any value is "gc all", all keys are removed.
+      size_t j;
+      for (j = 0; j < num_keys; j++) {
+        to_delete_list[j] = 1;
+      }
+      return;
+    } else if (existing_values_list_sizes[i] == 6 && memcmp(existing_values_list[i], "change", 6) == 0) {
+      // If value is "change", set changed value to "changed".
+      size_t len;
+      len = strlen("changed");
+      new_values_list[i] = malloc(len);
+      memcpy(new_values_list[i], "changed", len);
+      new_values_list_sizes[i] = len;
+    } else {
+      // Otherwise, no keys are removed.
+    }
+  }
+}
+
+// Custom prefix extractor for compaction filter V2 which extracts first 3 characters.
+static void CFV2PrefixExtractorDestroy(void* arg) { }
+static char* CFV2PrefixExtractorTransform(void* arg, const char* key, size_t length, size_t* dst_length) {
+  // Verify keys are maximum length 4; this verifies fix for a
+  // prior bug which was passing the RocksDB-encoded key with
+  // logical timestamp suffix instead of parsed user key.
+  if (length > 4) {
+    fprintf(stderr, "%s:%d: %s: key %s is not user key\n", __FILE__, __LINE__, phase, key);
+    abort();
+  }
+  *dst_length = length < 3 ? length : 3;
+  return (char*)key;
+}
+static unsigned char CFV2PrefixExtractorInDomain(void* state, const char* key, size_t length) {
+  return 1;
+}
+static unsigned char CFV2PrefixExtractorInRange(void* state, const char* key, size_t length) {
+  return 1;
+}
+static const char* CFV2PrefixExtractorName(void* state) {
+  return "TestCFV2PrefixExtractor";
+}
+
+// Custom compaction filter factory V2.
+static void CompactionFilterFactoryV2Destroy(void* arg) {
+  rocksdb_slicetransform_destroy((rocksdb_slicetransform_t*)arg);
+}
+static const char* CompactionFilterFactoryV2Name(void* arg) {
+  return "TestCompactionFilterFactoryV2";
+}
+static rocksdb_compactionfilterv2_t* CompactionFilterFactoryV2Create(
+    void* state, const rocksdb_compactionfiltercontext_t* context) {
+  return rocksdb_compactionfilterv2_create(state, CompactionFilterV2Destroy,
+                                           CompactionFilterV2Filter,
+                                           CompactionFilterV2Name);
+}
+
+// Custom merge operator
+static void MergeOperatorDestroy(void* arg) { }
+static const char* MergeOperatorName(void* arg) {
+  return "TestMergeOperator";
+}
+static char* MergeOperatorFullMerge(
+    void* arg,
+    const char* key, size_t key_length,
+    const char* existing_value, size_t existing_value_length,
+    const char* const* operands_list, const size_t* operands_list_length,
+    int num_operands,
+    unsigned char* success, size_t* new_value_length) {
+  *new_value_length = 4;
+  *success = 1;
+  char* result = malloc(4);
+  memcpy(result, "fake", 4);
+  return result;
+}
+static char* MergeOperatorPartialMerge(
+    void* arg,
+    const char* key, size_t key_length,
+    const char* const* operands_list, const size_t* operands_list_length,
+    int num_operands,
+    unsigned char* success, size_t* new_value_length) {
+  *new_value_length = 4;
+  *success = 1;
+  char* result = malloc(4);
+  memcpy(result, "fake", 4);
+  return result;
+}
+
 int main(int argc, char** argv) {
   rocksdb_t* db;
   rocksdb_comparator_t* cmp;
   rocksdb_cache_t* cache;
   rocksdb_env_t* env;
   rocksdb_options_t* options;
+  rocksdb_block_based_table_options_t* table_options;
   rocksdb_readoptions_t* roptions;
   rocksdb_writeoptions_t* woptions;
   char* err = NULL;
@@ -178,14 +354,15 @@ int main(int argc, char** argv) {
   options = rocksdb_options_create();
   rocksdb_options_set_comparator(options, cmp);
   rocksdb_options_set_error_if_exists(options, 1);
-  rocksdb_options_set_cache(options, cache);
   rocksdb_options_set_env(options, env);
   rocksdb_options_set_info_log(options, NULL);
   rocksdb_options_set_write_buffer_size(options, 100000);
   rocksdb_options_set_paranoid_checks(options, 1);
   rocksdb_options_set_max_open_files(options, 10);
-  rocksdb_options_set_block_size(options, 1024);
-  rocksdb_options_set_block_restart_interval(options, 8);
+  table_options = rocksdb_block_based_options_create();
+  rocksdb_block_based_options_set_block_cache(table_options, cache);
+  rocksdb_options_set_block_based_table_factory(options, table_options);
+
   rocksdb_options_set_compression(options, rocksdb_no_compression);
   rocksdb_options_set_compression_options(options, -14, -1, 0);
   int compression_levels[] = {rocksdb_no_compression, rocksdb_no_compression,
@@ -244,6 +421,24 @@ int main(int argc, char** argv) {
     rocksdb_writebatch_iterate(wb, &pos, CheckPut, CheckDel);
     CheckCondition(pos == 3);
     rocksdb_writebatch_destroy(wb);
+  }
+
+  StartPhase("writebatch_rep");
+  {
+    rocksdb_writebatch_t* wb1 = rocksdb_writebatch_create();
+    rocksdb_writebatch_put(wb1, "baz", 3, "d", 1);
+    rocksdb_writebatch_put(wb1, "quux", 4, "e", 1);
+    rocksdb_writebatch_delete(wb1, "quux", 4);
+    size_t repsize1 = 0;
+    const char* rep = rocksdb_writebatch_data(wb1, &repsize1);
+    rocksdb_writebatch_t* wb2 = rocksdb_writebatch_create_from(rep, repsize1);
+    CheckCondition(rocksdb_writebatch_count(wb1) ==
+                   rocksdb_writebatch_count(wb2));
+    size_t repsize2 = 0;
+    CheckCondition(
+        memcmp(rep, rocksdb_writebatch_data(wb2, &repsize2), repsize1) == 0);
+    rocksdb_writebatch_destroy(wb1);
+    rocksdb_writebatch_destroy(wb2);
   }
 
   StartPhase("iter");
@@ -342,15 +537,17 @@ int main(int argc, char** argv) {
     rocksdb_filterpolicy_t* policy;
     if (run == 0) {
       policy = rocksdb_filterpolicy_create(
-          NULL, FilterDestroy, FilterCreate, FilterKeyMatch, FilterName);
+          NULL, FilterDestroy, FilterCreate, FilterKeyMatch, NULL, FilterName);
     } else {
       policy = rocksdb_filterpolicy_create_bloom(10);
     }
 
+    rocksdb_block_based_options_set_filter_policy(table_options, policy);
+
     // Create new database
     rocksdb_close(db);
     rocksdb_destroy_db(options, dbname, &err);
-    rocksdb_options_set_filter_policy(options, policy);
+    rocksdb_options_set_block_based_table_factory(options, table_options);
     db = rocksdb_open(options, dbname, &err);
     CheckNoError(err);
     rocksdb_put(db, woptions, "foo", 3, "foovalue", 8, &err);
@@ -372,13 +569,245 @@ int main(int argc, char** argv) {
       CheckGet(db, roptions, "foo", "foovalue");
       CheckGet(db, roptions, "bar", "barvalue");
     }
-    rocksdb_options_set_filter_policy(options, NULL);
-    rocksdb_filterpolicy_destroy(policy);
+    // Reset the policy
+    rocksdb_block_based_options_set_filter_policy(table_options, NULL);
+    rocksdb_options_set_block_based_table_factory(options, table_options);
   }
+
+  StartPhase("compaction_filter");
+  {
+    rocksdb_options_t* options_with_filter = rocksdb_options_create();
+    rocksdb_options_set_create_if_missing(options_with_filter, 1);
+    rocksdb_compactionfilter_t* cfilter;
+    cfilter = rocksdb_compactionfilter_create(NULL, CFilterDestroy,
+                                              CFilterFilter, CFilterName);
+    // Create new database
+    rocksdb_close(db);
+    rocksdb_destroy_db(options_with_filter, dbname, &err);
+    rocksdb_options_set_compaction_filter(options_with_filter, cfilter);
+    db = CheckCompaction(db, options_with_filter, roptions, woptions);
+
+    rocksdb_options_set_compaction_filter(options_with_filter, NULL);
+    rocksdb_compactionfilter_destroy(cfilter);
+    rocksdb_options_destroy(options_with_filter);
+  }
+
+  StartPhase("compaction_filter_factory");
+  {
+    rocksdb_options_t* options_with_filter_factory = rocksdb_options_create();
+    rocksdb_options_set_create_if_missing(options_with_filter_factory, 1);
+    rocksdb_compactionfilterfactory_t* factory;
+    factory = rocksdb_compactionfilterfactory_create(
+        NULL, CFilterFactoryDestroy, CFilterCreate, CFilterFactoryName);
+    // Create new database
+    rocksdb_close(db);
+    rocksdb_destroy_db(options_with_filter_factory, dbname, &err);
+    rocksdb_options_set_compaction_filter_factory(options_with_filter_factory,
+                                                  factory);
+    db = CheckCompaction(db, options_with_filter_factory, roptions, woptions);
+
+    rocksdb_options_set_compaction_filter_factory(
+        options_with_filter_factory, NULL);
+    rocksdb_options_destroy(options_with_filter_factory);
+  }
+
+  StartPhase("compaction_filter_v2");
+  {
+    rocksdb_compactionfilterfactoryv2_t* factory;
+    rocksdb_slicetransform_t* prefix_extractor;
+    prefix_extractor = rocksdb_slicetransform_create(
+        NULL, CFV2PrefixExtractorDestroy, CFV2PrefixExtractorTransform,
+        CFV2PrefixExtractorInDomain, CFV2PrefixExtractorInRange,
+        CFV2PrefixExtractorName);
+    factory = rocksdb_compactionfilterfactoryv2_create(
+        prefix_extractor, prefix_extractor, CompactionFilterFactoryV2Destroy,
+        CompactionFilterFactoryV2Create, CompactionFilterFactoryV2Name);
+    // Create new database
+    rocksdb_close(db);
+    rocksdb_destroy_db(options, dbname, &err);
+    rocksdb_options_set_compaction_filter_factory_v2(options, factory);
+    db = rocksdb_open(options, dbname, &err);
+    CheckNoError(err);
+    // Only foo2 is GC'd, foo3 is changed.
+    rocksdb_put(db, woptions, "foo1", 4, "no gc", 5, &err);
+    CheckNoError(err);
+    rocksdb_put(db, woptions, "foo2", 4, "gc", 2, &err);
+    CheckNoError(err);
+    rocksdb_put(db, woptions, "foo3", 4, "change", 6, &err);
+    CheckNoError(err);
+    // All bars are GC'd.
+    rocksdb_put(db, woptions, "bar1", 4, "no gc", 5, &err);
+    CheckNoError(err);
+    rocksdb_put(db, woptions, "bar2", 4, "gc all", 6, &err);
+    CheckNoError(err);
+    rocksdb_put(db, woptions, "bar3", 4, "no gc", 5, &err);
+    CheckNoError(err);
+    // Compact the DB to garbage collect.
+    rocksdb_compact_range(db, NULL, 0, NULL, 0);
+
+    // Verify foo entries.
+    CheckGet(db, roptions, "foo1", "no gc");
+    CheckGet(db, roptions, "foo2", NULL);
+    CheckGet(db, roptions, "foo3", "changed");
+    // Verify bar entries were all deleted.
+    CheckGet(db, roptions, "bar1", NULL);
+    CheckGet(db, roptions, "bar2", NULL);
+    CheckGet(db, roptions, "bar3", NULL);
+  }
+
+  StartPhase("merge_operator");
+  {
+    rocksdb_mergeoperator_t* merge_operator;
+    merge_operator = rocksdb_mergeoperator_create(
+        NULL, MergeOperatorDestroy, MergeOperatorFullMerge,
+        MergeOperatorPartialMerge, NULL, MergeOperatorName);
+    // Create new database
+    rocksdb_close(db);
+    rocksdb_destroy_db(options, dbname, &err);
+    rocksdb_options_set_merge_operator(options, merge_operator);
+    db = rocksdb_open(options, dbname, &err);
+    CheckNoError(err);
+    rocksdb_put(db, woptions, "foo", 3, "foovalue", 8, &err);
+    CheckNoError(err);
+    CheckGet(db, roptions, "foo", "foovalue");
+    rocksdb_merge(db, woptions, "foo", 3, "barvalue", 8, &err);
+    CheckNoError(err);
+    CheckGet(db, roptions, "foo", "fake");
+
+    // Merge of a non-existing value
+    rocksdb_merge(db, woptions, "bar", 3, "barvalue", 8, &err);
+    CheckNoError(err);
+    CheckGet(db, roptions, "bar", "fake");
+
+  }
+
+  StartPhase("columnfamilies");
+  {
+    rocksdb_close(db);
+    rocksdb_destroy_db(options, dbname, &err);
+    CheckNoError(err)
+
+    rocksdb_options_t* db_options = rocksdb_options_create();
+    rocksdb_options_set_create_if_missing(db_options, 1);
+    db = rocksdb_open(db_options, dbname, &err);
+    CheckNoError(err)
+    rocksdb_column_family_handle_t* cfh;
+    cfh = rocksdb_create_column_family(db, db_options, "cf1", &err);
+    rocksdb_column_family_handle_destroy(cfh);
+    CheckNoError(err);
+    rocksdb_close(db);
+
+    size_t cflen;
+    char** column_fams = rocksdb_list_column_families(db_options, dbname, &cflen, &err);
+    CheckNoError(err);
+    CheckEqual("default", column_fams[0], 7);
+    CheckEqual("cf1", column_fams[1], 3);
+    CheckCondition(cflen == 2);
+    rocksdb_list_column_families_destroy(column_fams, cflen);
+
+    rocksdb_options_t* cf_options = rocksdb_options_create();
+
+    const char* cf_names[2] = {"default", "cf1"};
+    const rocksdb_options_t* cf_opts[2] = {cf_options, cf_options};
+    rocksdb_column_family_handle_t* handles[2];
+    db = rocksdb_open_column_families(db_options, dbname, 2, cf_names, cf_opts, handles, &err);
+    CheckNoError(err);
+
+    rocksdb_put_cf(db, woptions, handles[1], "foo", 3, "hello", 5, &err);
+    CheckNoError(err);
+
+    CheckGetCF(db, roptions, handles[1], "foo", "hello");
+
+    rocksdb_delete_cf(db, woptions, handles[1], "foo", 3, &err);
+    CheckNoError(err);
+
+    CheckGetCF(db, roptions, handles[1], "foo", NULL);
+
+    rocksdb_writebatch_t* wb = rocksdb_writebatch_create();
+    rocksdb_writebatch_put_cf(wb, handles[1], "baz", 3, "a", 1);
+    rocksdb_writebatch_clear(wb);
+    rocksdb_writebatch_put_cf(wb, handles[1], "bar", 3, "b", 1);
+    rocksdb_writebatch_put_cf(wb, handles[1], "box", 3, "c", 1);
+    rocksdb_writebatch_delete_cf(wb, handles[1], "bar", 3);
+    rocksdb_write(db, woptions, wb, &err);
+    CheckNoError(err);
+    CheckGetCF(db, roptions, handles[1], "baz", NULL);
+    CheckGetCF(db, roptions, handles[1], "bar", NULL);
+    CheckGetCF(db, roptions, handles[1], "box", "c");
+    rocksdb_writebatch_destroy(wb);
+
+    rocksdb_iterator_t* iter = rocksdb_create_iterator_cf(db, roptions, handles[1]);
+    CheckCondition(!rocksdb_iter_valid(iter));
+    rocksdb_iter_seek_to_first(iter);
+    CheckCondition(rocksdb_iter_valid(iter));
+
+    int i;
+    for (i = 0; rocksdb_iter_valid(iter) != 0; rocksdb_iter_next(iter)) {
+      i++;
+    }
+    CheckCondition(i == 1);
+    rocksdb_iter_get_error(iter, &err);
+    CheckNoError(err);
+    rocksdb_iter_destroy(iter);
+
+    rocksdb_drop_column_family(db, handles[1], &err);
+    CheckNoError(err);
+    for (i = 0; i < 2; i++) {
+      rocksdb_column_family_handle_destroy(handles[i]);
+    }
+    rocksdb_close(db);
+    rocksdb_destroy_db(options, dbname, &err);
+    rocksdb_options_destroy(db_options);
+    rocksdb_options_destroy(cf_options);
+  }
+
+  StartPhase("prefix");
+  {
+    // Create new database
+    rocksdb_options_set_allow_mmap_reads(options, 1);
+    rocksdb_options_set_prefix_extractor(options, rocksdb_slicetransform_create_fixed_prefix(3));
+    rocksdb_options_set_hash_skip_list_rep(options, 5000, 4, 4);
+    rocksdb_options_set_plain_table_factory(options, 4, 10, 0.75, 16);
+
+    db = rocksdb_open(options, dbname, &err);
+    CheckNoError(err);
+
+    rocksdb_put(db, woptions, "foo1", 4, "foo", 3, &err);
+    CheckNoError(err);
+    rocksdb_put(db, woptions, "foo2", 4, "foo", 3, &err);
+    CheckNoError(err);
+    rocksdb_put(db, woptions, "foo3", 4, "foo", 3, &err);
+    CheckNoError(err);
+    rocksdb_put(db, woptions, "bar1", 4, "bar", 3, &err);
+    CheckNoError(err);
+    rocksdb_put(db, woptions, "bar2", 4, "bar", 3, &err);
+    CheckNoError(err);
+    rocksdb_put(db, woptions, "bar3", 4, "bar", 3, &err);
+    CheckNoError(err);
+
+    rocksdb_iterator_t* iter = rocksdb_create_iterator(db, roptions);
+    CheckCondition(!rocksdb_iter_valid(iter));
+
+    rocksdb_iter_seek(iter, "bar", 3);
+    rocksdb_iter_get_error(iter, &err);
+    CheckNoError(err);
+    CheckCondition(rocksdb_iter_valid(iter));
+
+    CheckIter(iter, "bar1", "bar");
+    rocksdb_iter_next(iter);
+    CheckIter(iter, "bar2", "bar");
+    rocksdb_iter_next(iter);
+    CheckIter(iter, "bar3", "bar");
+    rocksdb_iter_get_error(iter, &err);
+    CheckNoError(err);
+    rocksdb_iter_destroy(iter);
+  }
+
 
   StartPhase("cleanup");
   rocksdb_close(db);
   rocksdb_options_destroy(options);
+  rocksdb_block_based_options_destroy(table_options);
   rocksdb_readoptions_destroy(roptions);
   rocksdb_writeoptions_destroy(woptions);
   rocksdb_cache_destroy(cache);

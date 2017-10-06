@@ -38,9 +38,16 @@ class PosixLogger : public Logger {
   Env* env_;
   bool flush_pending_;
  public:
-  PosixLogger(FILE* f, uint64_t (*gettid)(), Env* env) :
-    file_(f), gettid_(gettid), log_size_(0), fd_(fileno(f)),
-    last_flush_micros_(0), env_(env), flush_pending_(false) { }
+  PosixLogger(FILE* f, uint64_t (*gettid)(), Env* env,
+              const InfoLogLevel log_level = InfoLogLevel::ERROR_LEVEL)
+      : Logger(log_level),
+        file_(f),
+        gettid_(gettid),
+        log_size_(0),
+        fd_(fileno(f)),
+        last_flush_micros_(0),
+        env_(env),
+        flush_pending_(false) {}
   virtual ~PosixLogger() {
     fclose(file_);
   }
@@ -116,14 +123,15 @@ class PosixLogger : public Logger {
       // space, pre-allocate more space to avoid overly large
       // allocations from filesystem allocsize options.
       const size_t log_size = log_size_;
-      const int last_allocation_chunk =
+      const size_t last_allocation_chunk =
         ((kDebugLogChunkSize - 1 + log_size) / kDebugLogChunkSize);
-      const int desired_allocation_chunk =
+      const size_t desired_allocation_chunk =
         ((kDebugLogChunkSize - 1 + log_size + write_size) /
            kDebugLogChunkSize);
       if (last_allocation_chunk != desired_allocation_chunk) {
-        fallocate(fd_, FALLOC_FL_KEEP_SIZE, 0,
-                  desired_allocation_chunk * kDebugLogChunkSize);
+        fallocate(
+            fd_, FALLOC_FL_KEEP_SIZE, 0,
+            static_cast<off_t>(desired_allocation_chunk * kDebugLogChunkSize));
       }
 #endif
 

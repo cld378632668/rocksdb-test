@@ -6,11 +6,16 @@
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
+#ifndef __STDC_FORMAT_MACROS
+#define __STDC_FORMAT_MACROS
+#endif
 
 #include "db/filename.h"
+#include <inttypes.h>
 
 #include <ctype.h>
 #include <stdio.h>
+#include <vector>
 #include "db/dbformat.h"
 #include "rocksdb/env.h"
 #include "util/logging.h"
@@ -18,14 +23,16 @@
 namespace rocksdb {
 
 // Given a path, flatten the path name by replacing all chars not in
-// {[0-9,a-z,A-Z,-,_,.]} with _. And append '\0' at the end.
+// {[0-9,a-z,A-Z,-,_,.]} with _. And append '_LOG\0' at the end.
 // Return the number of chars stored in dest not including the trailing '\0'.
-static int FlattenPath(const std::string& path, char* dest, int len) {
-  int write_idx = 0;
-  int i = 0;
-  int src_len = path.size();
+static size_t GetInfoLogPrefix(const std::string& path, char* dest, int len) {
+  const char suffix[] = "_LOG";
 
-  while (i < src_len && write_idx < len - 1) {
+  size_t write_idx = 0;
+  size_t i = 0;
+  size_t src_len = path.size();
+
+  while (i < src_len && write_idx < len - sizeof(suffix)) {
     if ((path[i] >= 'a' && path[i] <= 'z') ||
         (path[i] >= '0' && path[i] <= '9') ||
         (path[i] >= 'A' && path[i] <= 'Z') ||
@@ -39,14 +46,12 @@ static int FlattenPath(const std::string& path, char* dest, int len) {
     }
     i++;
   }
-
-  dest[write_idx] = '\0';
+  assert(sizeof(suffix) <= len - write_idx);
+  // "\0" is automatically added by snprintf
+  snprintf(dest + write_idx, len - write_idx, suffix);
+  write_idx += sizeof(suffix) - 1;
   return write_idx;
 }
-
-// A utility routine: write "data" to the named file and Sync() it.
-extern Status WriteStringToFileSync(Env* env, const Slice& data,
-                                    const std::string& fname);
 
 static std::string MakeFileName(const std::string& name, uint64_t number,
                                 const char* suffix) {
@@ -70,9 +75,45 @@ std::string ArchivedLogFileName(const std::string& name, uint64_t number) {
   return MakeFileName(name + "/" + ARCHIVAL_DIR, number, "log");
 }
 
-std::string TableFileName(const std::string& name, uint64_t number) {
+std::string MakeTableFileName(const std::string& path, uint64_t number) {
+  return MakeFileName(path, number, "sst");
+}
+
+uint64_t TableFileNameToNumber(const std::string& name) {
+  uint64_t number = 0;
+  uint64_t base = 1;
+  int pos = static_cast<int>(name.find_last_of('.'));
+  while (--pos >= 0 && name[pos] >= '0' && name[pos] <= '9') {
+    number += (name[pos] - '0') * base;
+    base *= 10;
+  }
+  return number;
+}
+
+std::string TableFileName(const std::vector<DbPath>& db_paths, uint64_t number,
+                          uint32_t path_id) {
   assert(number > 0);
-  return MakeFileName(name, number, "sst");
+  std::string path;
+  if (path_id >= db_paths.size()) {
+    path = db_paths.back().path;
+  } else {
+    path = db_paths[path_id].path;
+  }
+  return MakeTableFileName(path, number);
+}
+
+const size_t kFormatFileNumberBufSize = 38;
+
+void FormatFileNumber(uint64_t number, uint32_t path_id, char* out_buf,
+                      size_t out_buf_size) {
+  if (path_id == 0) {
+    snprintf(out_buf, out_buf_size, "%" PRIu64, number);
+  } else {
+    snprintf(out_buf, out_buf_size, "%" PRIu64
+                                    "(path "
+                                    "%" PRIu32 ")",
+             number, path_id);
+  }
 }
 
 std::string DescriptorFileName(const std::string& dbname, uint64_t number) {
@@ -92,8 +133,20 @@ std::string LockFileName(const std::string& dbname) {
 }
 
 std::string TempFileName(const std::string& dbname, uint64_t number) {
-  assert(number >= 0);
   return MakeFileName(dbname, number, "dbtmp");
+}
+
+InfoLogPrefix::InfoLogPrefix(bool has_log_dir,
+                             const std::string& db_absolute_path) {
+  if (!has_log_dir) {
+    const char kInfoLogPrefix[] = "LOG";
+    // "\0" is automatically added to the end
+    snprintf(buf, sizeof(buf), kInfoLogPrefix);
+    prefix = Slice(buf, sizeof(kInfoLogPrefix) - 1);
+  } else {
+    size_t len = GetInfoLogPrefix(db_absolute_path, buf, sizeof(buf));
+    prefix = Slice(buf, len);
+  }
 }
 
 std::string InfoLogFileName(const std::string& dbname,
@@ -101,9 +154,8 @@ std::string InfoLogFileName(const std::string& dbname,
   if (log_dir.empty())
     return dbname + "/LOG";
 
-  char flatten_db_path[256];
-  FlattenPath(db_path, flatten_db_path, 256);
-  return log_dir + "/" + flatten_db_path + "_LOG";
+  InfoLogPrefix info_log_prefix(true, db_path);
+  return log_dir + "/" + info_log_prefix.buf;
 }
 
 // Return the name of the old info log file for "dbname".
@@ -115,9 +167,8 @@ std::string OldInfoLogFileName(const std::string& dbname, uint64_t ts,
   if (log_dir.empty())
     return dbname + "/LOG.old." + buf;
 
-  char flatten_db_path[256];
-  FlattenPath(db_path, flatten_db_path, 256);
-  return log_dir + "/" + flatten_db_path + "_LOG.old." + buf;
+  InfoLogPrefix info_log_prefix(true, db_path);
+  return log_dir + "/" + info_log_prefix.buf + ".old." + buf;
 }
 
 std::string MetaDatabaseName(const std::string& dbname, uint64_t number) {
@@ -135,8 +186,8 @@ std::string IdentityFileName(const std::string& dbname) {
 //    dbname/IDENTITY
 //    dbname/CURRENT
 //    dbname/LOCK
-//    dbname/LOG
-//    dbname/LOG.old.[0-9]+
+//    dbname/<info_log_name_prefix>
+//    dbname/<info_log_name_prefix>.old.[0-9]+
 //    dbname/MANIFEST-[0-9]+
 //    dbname/[0-9]+.(log|sst)
 //    dbname/METADB-[0-9]+
@@ -144,6 +195,12 @@ std::string IdentityFileName(const std::string& dbname) {
 bool ParseFileName(const std::string& fname,
                    uint64_t* number,
                    FileType* type,
+                   WalFileType* log_type) {
+  return ParseFileName(fname, number, "", type, log_type);
+}
+
+bool ParseFileName(const std::string& fname, uint64_t* number,
+                   const Slice& info_log_name_prefix, FileType* type,
                    WalFileType* log_type) {
   Slice rest(fname);
   if (fname.length() > 1 && fname[0] == '/') {
@@ -158,18 +215,22 @@ bool ParseFileName(const std::string& fname,
   } else if (rest == "LOCK") {
     *number = 0;
     *type = kDBLockFile;
-  } else if (rest == "LOG" || rest == "LOG.old") {
-    *number = 0;
-    *type = kInfoLogFile;
-  } else if (rest.starts_with("LOG.old.")) {
-    uint64_t ts_suffix;
-    // sizeof also counts the trailing '\0'.
-    rest.remove_prefix(sizeof("LOG.old.") - 1);
-    if (!ConsumeDecimalNumber(&rest, &ts_suffix)) {
-      return false;
+  } else if (info_log_name_prefix.size() > 0 &&
+             rest.starts_with(info_log_name_prefix)) {
+    rest.remove_prefix(info_log_name_prefix.size());
+    if (rest == "" || rest == ".old") {
+      *number = 0;
+      *type = kInfoLogFile;
+    } else if (rest.starts_with(".old.")) {
+      uint64_t ts_suffix;
+      // sizeof also counts the trailing '\0'.
+      rest.remove_prefix(sizeof(".old.") - 1);
+      if (!ConsumeDecimalNumber(&rest, &ts_suffix)) {
+        return false;
+      }
+      *number = ts_suffix;
+      *type = kInfoLogFile;
     }
-    *number = ts_suffix;
-    *type = kInfoLogFile;
   } else if (rest.starts_with("MANIFEST-")) {
     rest.remove_prefix(strlen("MANIFEST-"));
     uint64_t num;
@@ -231,18 +292,23 @@ bool ParseFileName(const std::string& fname,
 }
 
 Status SetCurrentFile(Env* env, const std::string& dbname,
-                      uint64_t descriptor_number) {
+                      uint64_t descriptor_number,
+                      Directory* directory_to_fsync) {
   // Remove leading "dbname/" and add newline to manifest file name
   std::string manifest = DescriptorFileName(dbname, descriptor_number);
   Slice contents = manifest;
   assert(contents.starts_with(dbname + "/"));
   contents.remove_prefix(dbname.size() + 1);
   std::string tmp = TempFileName(dbname, descriptor_number);
-  Status s = WriteStringToFileSync(env, contents.ToString() + "\n", tmp);
+  Status s = WriteStringToFile(env, contents.ToString() + "\n", tmp, true);
   if (s.ok()) {
     s = env->RenameFile(tmp, CurrentFileName(dbname));
   }
-  if (!s.ok()) {
+  if (s.ok()) {
+    if (directory_to_fsync != nullptr) {
+      directory_to_fsync->Fsync();
+    }
+  } else {
     env->DeleteFile(tmp);
   }
   return s;
@@ -253,7 +319,7 @@ Status SetIdentityFile(Env* env, const std::string& dbname) {
   assert(!id.empty());
   // Reserve the filename dbname/000000.dbtmp for the temporary identity file
   std::string tmp = TempFileName(dbname, 0);
-  Status s = WriteStringToFileSync(env, id, tmp);
+  Status s = WriteStringToFile(env, id, tmp, true);
   if (s.ok()) {
     s = env->RenameFile(tmp, IdentityFileName(dbname));
   }

@@ -2,32 +2,37 @@
 //  This source code is licensed under the BSD-style license found in the
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
-//
+
+#ifndef ROCKSDB_LITE
+#ifndef __STDC_FORMAT_MACROS
+#define __STDC_FORMAT_MACROS
+#endif
+
+#include <inttypes.h>
 #include "db/transaction_log_impl.h"
 #include "db/write_batch_internal.h"
 
 namespace rocksdb {
 
 TransactionLogIteratorImpl::TransactionLogIteratorImpl(
-                           const std::string& dir,
-                           const Options* options,
-                           const EnvOptions& soptions,
-                           const SequenceNumber seq,
-                           std::unique_ptr<VectorLogPtr> files,
-                           DBImpl const * const dbimpl) :
-    dir_(dir),
-    options_(options),
-    soptions_(soptions),
-    startingSequenceNumber_(seq),
-    files_(std::move(files)),
-    started_(false),
-    isValid_(false),
-    currentFileIndex_(0),
-    currentBatchSeq_(0),
-    currentLastSeq_(0),
-    dbimpl_(dbimpl) {
+    const std::string& dir, const DBOptions* options,
+    const TransactionLogIterator::ReadOptions& read_options,
+    const EnvOptions& soptions, const SequenceNumber seq,
+    std::unique_ptr<VectorLogPtr> files, VersionSet const* const versions)
+    : dir_(dir),
+      options_(options),
+      read_options_(read_options),
+      soptions_(soptions),
+      startingSequenceNumber_(seq),
+      files_(std::move(files)),
+      started_(false),
+      isValid_(false),
+      currentFileIndex_(0),
+      currentBatchSeq_(0),
+      currentLastSeq_(0),
+      versions_(versions) {
   assert(files_ != nullptr);
-  assert(dbimpl_ != nullptr);
+  assert(versions_ != nullptr);
 
   reporter_.env = options_->env;
   reporter_.info_log = options_->info_log.get();
@@ -43,17 +48,14 @@ Status TransactionLogIteratorImpl::OpenLogFile(
     return env->NewSequentialFile(fname, file, soptions_);
   } else {
     std::string fname = LogFileName(dir_, logFile->LogNumber());
-    Status status = env->NewSequentialFile(fname, file, soptions_);
-    if (!status.ok()) {
+    Status s = env->NewSequentialFile(fname, file, soptions_);
+    if (!s.ok()) {
       //  If cannot open file in DB directory.
       //  Try the archive dir, as it could have moved in the meanwhile.
       fname = ArchivedLogFileName(dir_, logFile->LogNumber());
-      status = env->NewSequentialFile(fname, file, soptions_);
-      if (!status.ok()) {
-        return Status::IOError("Requested file not present in the dir");
-      }
+      s = env->NewSequentialFile(fname, file, soptions_);
     }
-    return status;
+    return s;
   }
 }
 
@@ -77,7 +79,7 @@ bool TransactionLogIteratorImpl::RestrictedRead(
     Slice* record,
     std::string* scratch) {
   // Don't read if no more complete entries to read from logs
-  if (currentLastSeq_ >= dbimpl_->GetLatestSequenceNumber()) {
+  if (currentLastSeq_ >= versions_->LastSequence()) {
     return false;
   }
   return currentLogReader_->ReadRecord(record, scratch);
@@ -96,6 +98,7 @@ void TransactionLogIteratorImpl::SeekToStartSequence(
   Status s = OpenLogReader(files_->at(startFileIndex).get());
   if (!s.ok()) {
     currentStatus_ = s;
+    reporter_.Info(currentStatus_.ToString().c_str());
     return;
   }
   while (RestrictedRead(&record, &scratch)) {
@@ -179,18 +182,18 @@ void TransactionLogIteratorImpl::NextImpl(bool internal) {
     // Open the next file
     if (currentFileIndex_ < files_->size() - 1) {
       ++currentFileIndex_;
-      Status status =OpenLogReader(files_->at(currentFileIndex_).get());
-      if (!status.ok()) {
+      Status s = OpenLogReader(files_->at(currentFileIndex_).get());
+      if (!s.ok()) {
         isValid_ = false;
-        currentStatus_ = status;
+        currentStatus_ = s;
         return;
       }
     } else {
       isValid_ = false;
-      if (currentLastSeq_ == dbimpl_->GetLatestSequenceNumber()) {
+      if (currentLastSeq_ == versions_->LastSequence()) {
         currentStatus_ = Status::OK();
       } else {
-        currentStatus_ = Status::IOError("NO MORE DATA LEFT");
+        currentStatus_ = Status::Corruption("NO MORE DATA LEFT");
       }
       return;
     }
@@ -205,12 +208,10 @@ bool TransactionLogIteratorImpl::IsBatchExpected(
   if (batchSeq != expectedSeq) {
     char buf[200];
     snprintf(buf, sizeof(buf),
-             "Discontinuity in log records. Got seq=%lu, Expected seq=%lu, "
-             "Last flushed seq=%lu.Log iterator will reseek the correct "
-             "batch.",
-             (unsigned long)batchSeq,
-             (unsigned long)expectedSeq,
-             (unsigned long)dbimpl_->GetLatestSequenceNumber());
+             "Discontinuity in log records. Got seq=%" PRIu64
+             ", Expected seq=%" PRIu64 ", Last flushed seq=%" PRIu64
+             ".Log iterator will reseek the correct batch.",
+             batchSeq, expectedSeq, versions_->LastSequence());
     reporter_.Info(buf);
     return false;
   }
@@ -242,7 +243,7 @@ void TransactionLogIteratorImpl::UpdateCurrentWriteBatch(const Slice& record) {
   currentLastSeq_ = currentBatchSeq_ +
                     WriteBatchInternal::Count(batch.get()) - 1;
   // currentBatchSeq_ can only change here
-  assert(currentLastSeq_ <= dbimpl_->GetLatestSequenceNumber());
+  assert(currentLastSeq_ <= versions_->LastSequence());
 
   currentBatch_ = move(batch);
   isValid_ = true;
@@ -251,14 +252,14 @@ void TransactionLogIteratorImpl::UpdateCurrentWriteBatch(const Slice& record) {
 
 Status TransactionLogIteratorImpl::OpenLogReader(const LogFile* logFile) {
   unique_ptr<SequentialFile> file;
-  Status status = OpenLogFile(logFile, &file);
-  if (!status.ok()) {
-    return status;
+  Status s = OpenLogFile(logFile, &file);
+  if (!s.ok()) {
+    return s;
   }
   assert(file);
-  currentLogReader_.reset(
-    new log::Reader(std::move(file), &reporter_, true, 0)
-  );
+  currentLogReader_.reset(new log::Reader(std::move(file), &reporter_,
+                                          read_options_.verify_checksums_, 0));
   return Status::OK();
 }
 }  //  namespace rocksdb
+#endif  // ROCKSDB_LITE

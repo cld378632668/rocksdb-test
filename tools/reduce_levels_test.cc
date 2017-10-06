@@ -76,6 +76,7 @@ Status ReduceLevelTest::OpenDB(bool create_if_missing, int num_levels,
   opt.num_levels = num_levels;
   opt.create_if_missing = create_if_missing;
   opt.max_mem_compaction_level = mem_table_compact_level;
+  opt.max_background_flushes = 0;
   rocksdb::Status st = rocksdb::DB::Open(opt, dbname_, &db_);
   if (!st.ok()) {
     fprintf(stderr, "Can't open the db:%s\n", st.ToString().c_str());
@@ -86,7 +87,8 @@ Status ReduceLevelTest::OpenDB(bool create_if_missing, int num_levels,
 bool ReduceLevelTest::ReduceLevels(int target_level) {
   std::vector<std::string> args = rocksdb::ReduceDBLevelsCommand::PrepareArgs(
       dbname_, target_level, false);
-  LDBCommand* level_reducer = LDBCommand::InitFromCmdLineArgs(args);
+  LDBCommand* level_reducer = LDBCommand::InitFromCmdLineArgs(
+      args, Options(), LDBOptions());
   level_reducer->Run();
   bool is_succeed = level_reducer->GetExecuteState().IsSucceed();
   delete level_reducer;
